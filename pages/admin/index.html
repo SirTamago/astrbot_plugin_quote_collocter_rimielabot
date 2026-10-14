@@ -34,13 +34,14 @@
           </label>
           <label>
             <span data-i18n="recentWindow">去重窗口</span>
-            <input id="recent_window" type="number" min="1" step="1" />
+            <input id="recent_window" type="number" min="0" step="1" />
           </label>
         </div>
 
         <h3 data-i18n="rarityWeights">稀有度权重</h3>
         <p class="hint" data-i18n="rarityHint">
-          数值越大越容易被抽到。默认 SR(3) 最易出，新卡(1) 与 SSSR(5) 被压低。
+          每次抽取先按权重决定星级、再在该星级内均匀抽图，所以权重占比就是出率；填 0 表示该星级不会被抽到。
+          默认出率约为 3星36%、4星23%、2星18%、5星14%、1星9%。
         </p>
         <div id="rarityWeights" class="rarity-grid">
           <!-- JS 动态生成滑块 -->
@@ -49,7 +50,7 @@
         <h3 data-i18n="pityTitle">保底配置</h3>
         <p class="hint" data-i18n="pityHint">
           每 N 抽必出一次对应星级，0 表示禁用该等级保底。默认每 10 抽必出一次 5 星。
-          保底命中且本群缺某档图时，顺次按星级降序兜底出图。
+          本群没有该星级（或更高星级）图片时保底不生效，计数保留，等有图后立即触发。
         </p>
         <div id="pityGrid" class="rarity-grid">
           <!-- JS 动态生成保底输入 -->

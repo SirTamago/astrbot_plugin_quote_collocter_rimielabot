@@ -23,7 +23,9 @@ QUOTES_ROOT = Path("data") / "plugin_data" / "quote_collocter"
 # 全局设置文件（供 WebUI Page 与插件共享读写）
 GLOBAL_SETTINGS_PATH = QUOTES_ROOT / "settings.json"
 
-# 默认稀有度权重（面板与 _conf_schema.json 默认值保持一致）
+# 默认稀有度权重（面板与 _conf_schema.json 默认值保持一致）。
+# 语义：每次抽取先按权重决定星级、再在该星级内均匀抽图，
+# 因此权重占比就是该星级的实际出率；权重 0 表示该星级不会被抽到。
 DEFAULT_RARITY_WEIGHTS = {
     "weight_5": 3,
     "weight_4": 5,
@@ -33,8 +35,8 @@ DEFAULT_RARITY_WEIGHTS = {
 }
 
 # 默认保底配置：每 N 抽必出一次对应星级，0 表示禁用该等级保底。
-# 默认每 10 抽必出一次 5 星。保底命中时若该群没有该等级图片，
-# 顺次向下找一个存在的等级（按星级降序）。
+# 默认每 10 抽必出一次 5 星。保底只在本群存在「该星级或更高星级」图片时生效，
+# 否则保留计数不消耗，等有图后立即触发（不会退化成硬凑低星）。
 DEFAULT_PITY = {
     "pity_5": 10,
     "pity_4": 0,
@@ -96,14 +98,25 @@ def quote_chain(path: str) -> list:
     return [Comp.Plain(text=text), Comp.Image.fromFileSystem(path)]
 
 
-class QuoteShuffler:
-    """群聊语录随机抽取器。
+class QuoteDrawer:
+    """群聊语录抽取器（独立同分布模型 / IID）。
 
-    采用「按稀有度加权不放回抽样 + 指针递增」的算法：
-    一轮之内每张图片恰好出现一次（不重复），但高权重（按稀有度配置）
-    的图片倾向排到队列更靠前，更早被抽到；一轮走完后重新加权洗牌。
-    通过 recent_window 避免新一局开头立刻复现上一局末尾的图片。
-    抽取队列持久化到群目录下的 order.json，重启后可继续。
+    每次抽卡都是独立随机，与上一次抽到什么无关：
+      1. 先按稀有度权重抽一个【星级】——权重占比即该星级的实际出率，
+         权重为 0 的星级不参与；若所有可抽星级的权重都为 0，则回退为按星级均匀；
+      2. 再在该星级的图片里【均匀】随机挑一张（不参考权重）；
+      3. 短期去重：同一星级内、最近 window 抽里出现过的图片不再参与本次抽取
+         （window = 0 关闭）。排除数量上限为「该星级图片数 - 1」，保证至少
+         剩一张可抽，因此该星级有 2 张以上图时不会连着出同一张；只有 1 张图
+         的星级无法避免重复。去重只作用于「选哪张」，不影响「选哪个星级」，
+         所以星级出率始终严格等于权重占比；
+      4. 保底：某星级「距上次抽出该星级」的抽数达到阈值时强制改抽该星级，
+         优先恰好该档，其次升档；该档及以上都没有图时不生效（保留计数不消耗，
+         等有图后立即触发），不会硬凑低星。
+
+    状态持久化到群目录下的 order.json（`since` 保底计数 + `recent` 最近抽到），
+    重启后可继续；文件名沿用旧版，升级时旧文件里的 `since` 直接兼容。
+
     """
 
     def __init__(
@@ -114,9 +127,10 @@ class QuoteShuffler:
         pity: dict | None = None,
     ):
         self.group_dir = group_dir
-        self.order_file = group_dir / "order.json"
-        self.window = max(1, int(window))
-        # 稀有度 -> 权重，缺省按 parse_quote_rarity 的默认（1）再兜底 1.0
+        self.state_file = group_dir / "order.json"
+        # 去重窗口：0 表示关闭去重
+        self.window = max(0, int(window))
+        # 稀有度 -> 权重（0 表示该星级不被抽到）
         self.weights = weights or {}
         # 保底：稀有度 -> 每 N 抽必出（0 表示禁用）
         self.pity = pity or {}
@@ -132,53 +146,60 @@ class QuoteShuffler:
 
     def _load(self) -> dict:
         try:
-            if self.order_file.exists():
-                with open(self.order_file, "r", encoding="utf-8") as f:
+            if self.state_file.exists():
+                with open(self.state_file, "r", encoding="utf-8") as f:
                     return json.load(f) or {}
         except Exception as e:
-            logger.warning(f"读取抽取队列失败，将重建: {e}")
+            logger.warning(f"读取抽卡状态失败，将重建: {e}")
         return {}
 
     def _save(self, data: dict) -> None:
         try:
             self.group_dir.mkdir(parents=True, exist_ok=True)
-            with open(self.order_file, "w", encoding="utf-8") as f:
+            with open(self.state_file, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False)
         except Exception as e:
-            logger.error(f"保存抽取队列失败: {e}")
+            logger.error(f"保存抽卡状态失败: {e}")
 
-    def _weight_of(self, filename: str) -> float:
-        """按文件名的稀有度查权重，未配置的稀有度回退到 1.0。"""
-        rarity, _ = parse_quote_rarity(filename)
-        return float(self.weights.get(rarity, 1.0) or 1.0)
+    def _weight_of(self, rarity: int) -> float:
+        """星级权重；未配置回退 1.0，0 或负数表示该星级不被抽到。"""
+        raw = self.weights.get(rarity)
+        if raw is None:
+            return 1.0
+        try:
+            return max(0.0, float(raw))
+        except (TypeError, ValueError):
+            return 1.0
 
-    def _weighted_shuffle(self, images: list[str]) -> list[str]:
-        """按稀有度权重做不放回抽样，返回一个全排列。
+    @staticmethod
+    def _rarity_pools(images: list[str]) -> dict[int, list[str]]:
+        """把图片按稀有度分组：{星级: [文件名, ...]}。"""
+        pools: dict[int, list[str]] = {}
+        for name in images:
+            rarity, _ = parse_quote_rarity(name)
+            pools.setdefault(rarity, []).append(name)
+        return pools
 
-        高权重的图片更早被选中（排到队列更前面），一轮内仍每张各出现一次。
-        所有权重之和 <= 0 时回退为均匀洗牌。
-        """
-        pool = list(images)
-        weights = [self._weight_of(name) for name in pool]
+    def _pick_rarity(self, pools: dict[int, list[str]]) -> int | None:
+        """按权重在「有图的星级」里抽一个；权重全为 0 时回退为均匀抽取。"""
+        rarities = sorted(pools)
+        if not rarities:
+            return None
+        weights = [self._weight_of(r) for r in rarities]
         if sum(weights) <= 0:
-            random.shuffle(pool)
-            return pool
-        out: list[str] = []
-        while pool:
-            i = random.choices(range(len(pool)), weights=weights, k=1)[0]
-            out.append(pool.pop(i))
-            weights.pop(i)
-        return out
+            return random.choice(rarities)
+        return random.choices(rarities, weights=weights, k=1)[0]
 
-    def _build_order(self, images: list[str], avoid: set[str]) -> dict:
-        """根据当前图片列表生成一个新的加权抽取顺序。"""
-        queue = self._weighted_shuffle(images)
-        # 尽量让新的开头不要是上一局末尾几张，避免连续重复
-        head = queue[: self.window]
-        tail = queue[self.window :]
-        head = [x for x in head if x not in avoid] + [x for x in head if x in avoid]
-        queue = head + tail
-        return {"order": queue, "index": 0}
+    @staticmethod
+    def _pity_rarity(present: set[int], min_rarity: int) -> int | None:
+        """保底目标星级：优先恰好 min_rarity，其次向上升档。
+
+        该档及以上都没有图时返回 None（调用方保留计数，不消耗保底）。
+        """
+        for r in range(min_rarity, 6):
+            if r in present:
+                return r
+        return None
 
     def _pity_load(self, data: dict) -> dict:
         """读取各星级「距上次抽出该星级」的抽数计数，缺失补 0。"""
@@ -190,117 +211,102 @@ class QuoteShuffler:
             for r in (1, 2, 3, 4, 5)
         }
 
-    def _pity_pick_target(
-        self, images: list[str], min_rarity: int, exclude: set[str]
-    ) -> str | None:
-        """在 images 中找一张稀有度 >= min_rarity 的图片（优先恰好 min_rarity）。
+    def _recent_load(self, data: dict, image_set: set[str]) -> list[str]:
+        """读取最近抽到的图片；过滤掉已删除/改名的文件，只留最后 window 张。"""
+        if self.window <= 0:
+            return []
+        recent = data.get("recent") or []
+        if not isinstance(recent, list):
+            return []
+        kept = [str(name) for name in recent if str(name) in image_set]
+        return kept[-self.window :]
 
-        按星级降序遍历可命中等级，在同一等级里挑不在 exclude 集合中的任一张。
-        找不到返回 None。
+    def _avoid_for(self, pool: list[str], recent: list[str]) -> set[str]:
+        """本星级在去重窗口内已抽到过的图片（由新到旧），最多排除 len(pool) - 1 张。
+
+        上限保证该星级至少还剩一张可抽，去重不会因为「整个星级都在窗口内」
+        而失效；该星级只有 1 张图时返回空集合（无法避免重复）。
         """
-        by_r: dict[int, list[str]] = {}
-        for name in images:
-            r, _ = parse_quote_rarity(name)
-            by_r.setdefault(r, []).append(name)
-        # 优先恰好该等级，其次更高等级（满足"优先等级高的，顺次往下排"的语义：
-        # 在保底要求出 >= X 时，先试 X，再 X+1... 因为高等级更稀有，命中后
-        # 仍按权重队列后续自然抽取。等级 X 不存在才升档）
-        for r in range(min_rarity, 6):
-            pool = [n for n in by_r.get(r, []) if n not in exclude]
-            if pool:
-                return random.choice(pool)
-        # 该档及以上都没有：向下顺次找
-        for r in range(min_rarity - 1, 0, -1):
-            pool = [n for n in by_r.get(r, []) if n not in exclude]
-            if pool:
-                return random.choice(pool)
-        return None
+        limit = min(self.window, max(0, len(pool) - 1))
+        if limit <= 0:
+            return set()
+        picked: list[str] = []
+        for name in reversed(recent):
+            if name in pool and name not in picked:
+                picked.append(name)
+                if len(picked) >= limit:
+                    break
+        return set(picked)
 
     def next(self) -> str | None:
-        """返回下一张语录图片的绝对路径，无可用图片时返回 None。
+        """返回本次抽到的语录图片绝对路径；无可用图片时返回 None。
 
-        保底机制：维护各星级「已连续多少抽没有出该星级」的计数。
-        每抽一次，所有启用保底的星级计数 +1。若某星级计数达到其阈值，
-        则在本次强制从队列里选取一张稀有度 >= 该档的图片（优先恰好该档，
-        该档不存在则升档；该档及以上都不存在则降档顺次求之于现有等级），
-        并把该图片从队列传过来，重置该星级计数；其它未命中的星级计数继续保留。
+        每次调用都是一次独立的「权重抽星级 + 星级内均匀抽图」，
+        并叠加短期去重与保底两个约束（两者都不会改变基础权重模型，
+        只在可用集合上做有意的偏置）。
         """
         images = self._list_images()
         if not images:
             return None
 
-        data = self._load()
-        order = data.get("order") or []
-        index = data.get("index", 0)
-        since = self._pity_load(data)
-
-        # 队列与当前实际图片不一致（新增/删除/首次）时重建
         image_set = set(images)
-        if not order or set(order) != image_set:
-            avoid = (
-                set(order[max(0, len(order) - index - self.window) :])
-                if order
-                else set()
-            )
-            new = self._build_order(images, avoid)
-            order, index = new["order"], new["index"]
+        data = self._load()
+        since = self._pity_load(data)
+        recent = self._recent_load(data, image_set)
 
-        if index >= len(order):
-            avoid = set(order[len(order) - self.window :]) if order else set()
-            new = self._build_order(images, avoid)
-            order, index = new["order"], new["index"]
+        # 去重只作用于「选哪张」，不影响「选哪个星级」：
+        # 星级权重不会被去重窗口重新归一化，因此星级出率始终严格等于权重占比。
+        pools = self._rarity_pools(images)
 
-        # 保底计数器累加一次（对启用保底的星级）
+        # 保底计数累加（只对启用保底的星级），并钳制在阈值以内，
+        # 这样「本群暂时没有该档图片」时计数最多显示成 N/N，不会无限增长。
         for r in (1, 2, 3, 4, 5):
             thr = int(self.pity.get(r, 0) or 0)
             if thr > 0:
-                since[r] = since.get(r, 0) + 1
+                since[r] = min(since.get(r, 0) + 1, thr)
 
-        # 保底触发判定：从高星到低星依次检查，优先命中等级最高的保底
-        target = order[index]
-        bumped = False
+        # 保底判定：从高星到低星依次检查，优先命中等级最高的保底
+        target_rarity: int | None = None
         triggered_r = 0
         for r in (5, 4, 3, 2, 1):
             thr = int(self.pity.get(r, 0) or 0)
-            if thr <= 0:
+            if thr <= 0 or since.get(r, 0) < thr:
                 continue
-            if since.get(r, 0) >= thr:
-                # 该档及其以上若均无可抽图片，则保底"卡死"，保留计数不消化
-                # 增量：把 since[r] 钳到 thr（不再继续累加到天文数字），下次有图立刻触发
-                pick = self._pity_pick_target(images, r, exclude={target})
-                if pick is None:
-                    pick = self._pity_pick_target(images, r, exclude=set())
-                if pick is None:
-                    since[r] = thr  # 钳制，避免溢出
-                    continue  # 该档无图可保底，留给下一档
-                triggered_r = r
-                if pick != target:
-                    try:
-                        pick_pos = order.index(pick, index)
-                    except ValueError:
-                        pick_pos = order.index(pick)
-                    order[index], order[pick_pos] = order[pick_pos], order[index]
-                    target = order[index]
-                    bumped = True
-                # 已出货 >= r：清零该档及以上保底计数
-                for cr in range(r, 6):
-                    since[cr] = 0
-                break
+            picked = self._pity_rarity(set(pools), r)
+            if picked is None:
+                # 本群没有该档及以上的图：钳制计数、跳过该档（等有图立即触发）
+                since[r] = thr
+                continue
+            target_rarity = picked
+            triggered_r = r
+            break
 
-        # 自然出货：重置实际抽到的稀有度（及其以上）的保底计数
+        # 权重抽星级：即使保底命中也会抽一次，便于调试看到「本来会抽到什么」
+        rarity_by_weight = self._pick_rarity(pools)
+        if target_rarity is None:
+            target_rarity = rarity_by_weight
+        if target_rarity is None:  # 理论上不可达（images 非空）
+            return None
+
+        # 星级内均匀选图：排除该星级去重窗口内已抽过的图（至少留一张）
+        pool_all = pools[target_rarity]
+        avoid = self._avoid_for(pool_all, recent)
+        pool = [n for n in pool_all if n not in avoid]
+        target = random.choice(pool or pool_all)
+
+        # 出货重置：抽到 out_r 星即满足所有「<= out_r」的保底计数
         out_r, _ = parse_quote_rarity(target)
-        for cr in range(out_r, 6):
+        for cr in range(1, out_r + 1):
             since[cr] = 0
 
-        index += 1
+        recent = (recent + [target])[-self.window :] if self.window > 0 else []
         self._save(
             {
-                "order": order,
-                "index": index,
                 "since": {str(k): v for k, v in since.items()},
+                "recent": recent,
             }
         )
-        if bumped and triggered_r:
+        if triggered_r:
             logger.info(
                 "保底命中："
                 f"群{self.group_dir.name} 第{triggered_r}星，触发抽取 {target}"
@@ -314,8 +320,8 @@ class QuotePlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.config = config
-        # 群 -> QuoteShuffler
-        self._shufflers: dict[str, QuoteShuffler] = {}
+        # 群 -> QuoteDrawer（缓存权重/保底/窗口配置快照）
+        self._drawers: dict[str, QuoteDrawer] = {}
         # 注册 WebUI Page 后端 API
         context.register_web_api(
             f"/{PLUGIN_NAME}/settings",
@@ -449,16 +455,23 @@ class QuotePlugin(Star):
             logger.error(f"保存群设置失败: {e}")
 
     def _load_rarity_weights(self) -> dict:
-        """优先从全局设置读取稀有度权重，整理成 {稀有度数字: 权重}。"""
+        """优先从全局设置读取稀有度权重，整理成 {稀有度数字: 权重}。
+
+        权重是该星级在抽取中的相对占比；0 表示该星级不被抽到
+        （不再被 `or 1.0` 当成 1.0）。缺字段回退默认，非法值回退默认。
+        """
         gs = self._load_global_settings()
         raw = gs.get("rarity_weights") or DEFAULT_RARITY_WEIGHTS
-        return {
-            5: float(raw.get("weight_5", DEFAULT_RARITY_WEIGHTS["weight_5"]) or 1.0),
-            4: float(raw.get("weight_4", DEFAULT_RARITY_WEIGHTS["weight_4"]) or 1.0),
-            3: float(raw.get("weight_3", DEFAULT_RARITY_WEIGHTS["weight_3"]) or 1.0),
-            2: float(raw.get("weight_2", DEFAULT_RARITY_WEIGHTS["weight_2"]) or 1.0),
-            1: float(raw.get("weight_1", DEFAULT_RARITY_WEIGHTS["weight_1"]) or 1.0),
-        }
+        out: dict[int, float] = {}
+        for rarity in (1, 2, 3, 4, 5):
+            key = f"weight_{rarity}"
+            try:
+                out[rarity] = max(
+                    0.0, float(raw.get(key, DEFAULT_RARITY_WEIGHTS[key]))
+                )
+            except (TypeError, ValueError):
+                out[rarity] = float(DEFAULT_RARITY_WEIGHTS[key])
+        return out
 
     def _load_pity(self) -> dict:
         """从全局设置读取保底配置，整理成 {稀有度数字: 每 N 抽必出, 0=禁用}。"""
@@ -473,16 +486,17 @@ class QuotePlugin(Star):
                 out[r] = 0
         return out
 
-    def _shuffler(self, group_id: str) -> QuoteShuffler:
-        if group_id not in self._shufflers:
+    def _drawer(self, group_id: str) -> QuoteDrawer:
+        """取本群的抽取器（缓存权重/保底/窗口配置快照）。"""
+        if group_id not in self._drawers:
             gs = self._load_global_settings()
-            self._shufflers[group_id] = QuoteShuffler(
+            self._drawers[group_id] = QuoteDrawer(
                 self._group_dir(group_id),
                 int(gs.get("recent_window", 8)),
                 self._load_rarity_weights(),
                 self._load_pity(),
             )
-        return self._shufflers[group_id]
+        return self._drawers[group_id]
 
     # ------------------------------------------------------------------ #
     # 图片下载
@@ -842,17 +856,12 @@ class QuotePlugin(Star):
                     return hit
         return None
 
-    def _invalidate_shuffler(self, group_id: str) -> None:
-        """删除已缓存的 shuffler，使下次抽取按新文件列表重建队列。"""
-        self._shufflers.pop(str(group_id), None)
-
     def _delete_quote_file(self, group_id: str, target: Path) -> tuple[bool, str]:
-        """删除语录文件及其投稿记录，并使随机队列失效。"""
+        """删除语录文件及其投稿记录（抽卡状态按现存文件自动收敛）。"""
         try:
             filename = target.name
             target.unlink()
             self._remove_submission_records(group_id, filename)
-            self._invalidate_shuffler(group_id)
             return True, f"⭐已删除语录：{filename}"
         except Exception as e:
             logger.error(f"删除语录失败: {e}")
@@ -877,7 +886,6 @@ class QuotePlugin(Star):
             old_filename = target.name
             target.rename(new_path)
             self._rename_submission_records(group_id, old_filename, new_path.name)
-            self._invalidate_shuffler(group_id)
             return True, f"⭐已重命名：\n{old_filename} → {new_path.name}"
         except Exception as e:
             logger.error(f"重命名失败: {e}")
@@ -900,7 +908,6 @@ class QuotePlugin(Star):
             old_filename = target.name
             target.rename(new_path)
             self._rename_submission_records(group_id, old_filename, new_path.name)
-            self._invalidate_shuffler(group_id)
             return True, f"⭐已修改稀有度：\n{old_filename} → {new_path.name}"
         except Exception as e:
             logger.error(f"改稀有度失败: {e}")
@@ -918,7 +925,6 @@ class QuotePlugin(Star):
         try:
             target.unlink()
             self._remove_submission_records(group_id, target.name)
-            self._invalidate_shuffler(group_id)
             return True, f"⭐已撤回投稿：{target.name}"
         except Exception as e:
             logger.error(f"撤回时删除文件失败: {e}")
@@ -974,7 +980,7 @@ class QuotePlugin(Star):
             return
 
         group_id = str(event.message_obj.group_id)
-        path = self._shuffler(group_id).next()
+        path = self._drawer(group_id).next()
         if path:
             yield event.chain_result(quote_chain(path))
         else:
@@ -990,7 +996,7 @@ class QuotePlugin(Star):
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def view_quote(self, event: AstrMessageEvent, name: str = ""):
-        """直接查看本群指定语录，不推进随机抽取队列"""
+        """直接查看本群指定语录，不影响抽卡状态"""
         if not name.strip():
             yield event.plain_result("⭐用法：/语录查看 <语录名>")
             event.stop_event()
@@ -1320,7 +1326,7 @@ class QuotePlugin(Star):
         gs = self._load_global_settings()
         prob = float(gs.get("poke_quote_probability", 0.85))
         if random.random() < prob:
-            path = self._shuffler(group_id).next()
+            path = self._drawer(group_id).next()
             if path:
                 yield event.chain_result(quote_chain(path))
                 event.stop_event()
@@ -1371,7 +1377,10 @@ class QuotePlugin(Star):
         )
 
     def _apply_group_settings(
-        self, group_id: str, mode: int | None = None, cooldown: int | None = None
+        self,
+        group_id: str,
+        mode: int | None = None,
+        cooldown: int | None = None,
     ) -> tuple[bool, str]:
         """校验并更新本群投稿模式与戳戳冷却。"""
         settings = self._load_settings(group_id)
@@ -1434,8 +1443,8 @@ class QuotePlugin(Star):
                 cur["poke_quote_probability"] = value
             if "recent_window" in payload:
                 value = int(payload["recent_window"])
-                if value < 1:
-                    return False, "recent_window 必须 >= 1", cur
+                if value < 0:
+                    return False, "recent_window 必须 >= 0（0 表示关闭去重）", cur
                 cur["recent_window"] = value
             if "rarity_weights" in payload:
                 weights = payload["rarity_weights"]
@@ -1461,7 +1470,7 @@ class QuotePlugin(Star):
             return False, "设置项类型无效", cur
 
         self._save_global_settings(cur)
-        self._shufflers.clear()
+        self._drawers.clear()
         return True, "全局设置已保存", cur
 
     # ------------------------------------------------------------------ #
@@ -1761,4 +1770,4 @@ class QuotePlugin(Star):
 
     async def terminate(self):
         """插件卸载时调用。"""
-        self._shufflers.clear()
+        self._drawers.clear()
