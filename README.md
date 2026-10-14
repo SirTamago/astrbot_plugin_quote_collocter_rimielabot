@@ -174,6 +174,9 @@ data/plugin_data/quote_collocter/
 插件自带一套**不需要 AstrBot** 的测试（`tests/` 目录，纯标准库）：
 
 ```bash
+# 一键自检：语法 + 配置 + WebUI 脚本 + 全部测试
+bash tests/run_tests.sh
+
 # 全部测试（55 个用例）
 python3 -m unittest discover -s tests
 
