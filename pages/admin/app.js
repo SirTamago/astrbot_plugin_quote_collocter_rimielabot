@@ -122,6 +122,52 @@ async function saveSettings() {
   }
 }
 
+// ---- 按群调试模式 ----
+async function loadGroupDebug() {
+  const group = $("debugGroupId").value.trim();
+  const msg = $("debugMsg");
+  msg.classList.remove("ok", "err");
+  msg.textContent = "";
+  if (!group) {
+    msg.classList.add("err");
+    msg.textContent = "请先填写群号";
+    return;
+  }
+  try {
+    const s = await bridge.apiGet("group-debug", { group_id: group });
+    $("group_debug_mode").value = String(s.debug_mode ?? 0);
+    msg.classList.add("ok");
+    msg.textContent = `群 ${s.group_id}：调试 ${s.debug_mode}｜投稿权限 ${s.mode}｜戳戳冷却 ${s.cooldown} 秒`;
+  } catch (e) {
+    msg.classList.add("err");
+    msg.textContent = "查询失败：" + e.message;
+  }
+}
+
+async function saveGroupDebug() {
+  const group = $("debugGroupId").value.trim();
+  const msg = $("debugMsg");
+  msg.classList.remove("ok", "err");
+  msg.textContent = "";
+  if (!group) {
+    msg.classList.add("err");
+    msg.textContent = "请先填写群号";
+    return;
+  }
+  try {
+    const s = await bridge.apiPost("group-debug", {
+      group_id: group,
+      debug_mode: Number($("group_debug_mode").value),
+    });
+    $("group_debug_mode").value = String(s.debug_mode ?? 0);
+    msg.classList.add("ok");
+    msg.textContent = `已保存：群 ${s.group_id} 调试模式 = ${s.debug_mode}`;
+  } catch (e) {
+    msg.classList.add("err");
+    msg.textContent = "保存失败：" + e.message;
+  }
+}
+
 function row(cells) {
   const tr = document.createElement("tr");
   for (const c of cells) {
@@ -179,6 +225,12 @@ async function main() {
 
   $("saveSettings").addEventListener("click", saveSettings);
   $("refreshLog").addEventListener("click", loadLog);
+  $("loadGroupDebug").addEventListener("click", loadGroupDebug);
+  $("saveGroupDebug").addEventListener("click", saveGroupDebug);
+  // 填了群号时自动查一次，方便确认当前值
+  $("debugGroupId").addEventListener("change", () => {
+    if ($("debugGroupId").value.trim()) loadGroupDebug();
+  });
 
   // 主题/语言变化时刷新文案
   bridge.onContext(() => applyI18n(bridge.getI18n()));

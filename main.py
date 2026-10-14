@@ -98,6 +98,73 @@ def quote_chain(path: str) -> list:
     return [Comp.Plain(text=text), Comp.Image.fromFileSystem(path)]
 
 
+def format_draw_trace(trace: dict | None, verbose: bool = True) -> str:
+    """把一次抽卡的调试数据渲染为可读文本（日志与群内附注共用）。
+
+    verbose=True 时额外输出权重明细与出货后的保底计数（用于日志）；
+    群内附注用 verbose=False，只保留出率、抽取过程与保底判定。
+    """
+    if not trace:
+        return ""
+
+    order = (5, 4, 3, 2, 1)
+    counts = trace.get("counts") or {}
+    weights = trace.get("weights") or {}
+    shares = trace.get("share") or {}
+    pity = trace.get("pity") or {}
+    thresholds = pity.get("thresholds") or {}
+    since_used = pity.get("since_used") or {}
+    since_after = pity.get("since_after") or {}
+    triggered = pity.get("triggered")
+    skipped = list(pity.get("skipped") or [])
+
+    count_text = " ".join(f"{r}★×{counts.get(r, 0)}" for r in order)
+    rate_text = " ".join(f"{r}★{shares[r] * 100:.1f}%" for r in order if r in shares)
+    enabled = [r for r in order if int(thresholds.get(r, 0) or 0) > 0]
+    use_text = (
+        " ".join(
+            f"{r}★{since_used.get(r, 0)}/{thresholds.get(r, 0)}" for r in enabled
+        )
+        if enabled
+        else "未启用"
+    )
+
+    by_weight = trace.get("rarity_by_weight")
+    final_rarity = trace.get("rarity_final")
+    pick_text = f"权重抽中 {by_weight}★" if by_weight else "权重未抽出星级"
+    if triggered:
+        pick_text += f" → 保底覆盖为 {final_rarity}★"
+
+    lines = [
+        f"[语录调试] 群{trace.get('group', '?')}"
+        f"｜图库 {int(trace.get('total', 0))} 张：{count_text}",
+        f"本次出率：{rate_text}",
+        f"抽取：{pick_text}"
+        f"｜{final_rarity}★ 候选 {int(trace.get('candidates', 0))}"
+        f"/{int(trace.get('pool_size', 0))} 张"
+        f"（去重窗口 {int(trace.get('window', 0))}，"
+        f"排除 {int(trace.get('excluded', 0))} 张）→ {trace.get('final', '')}",
+        (
+            f"保底：触发 {triggered}★"
+            f"（判定 {since_used.get(triggered, 0)}/{thresholds.get(triggered, 0)}）"
+            if triggered
+            else f"保底：未触发（{use_text}）"
+        ),
+    ]
+    if skipped:
+        lines[-1] += "；" + "、".join(
+            f"{r}★ 已达阈值但本群无该档及以上图片（计数保留）" for r in skipped
+        )
+    if verbose:
+        lines.insert(
+            1, "权重：" + " ".join(f"{r}★{weights.get(r, 0):g}" for r in order)
+        )
+        lines.append(
+            "出货后计数：" + " ".join(f"{r}★{since_after.get(r, 0)}" for r in order)
+        )
+    return "\n".join(lines)
+
+
 class QuoteDrawer:
     """群聊语录抽取器（独立同分布模型 / IID）。
 
@@ -117,6 +184,9 @@ class QuoteDrawer:
     状态持久化到群目录下的 order.json（`since` 保底计数 + `recent` 最近抽到），
     重启后可继续；文件名沿用旧版，升级时旧文件里的 `since` 直接兼容。
 
+    调试：每次抽取后把本次的模型状态写入 `self.last_trace`（图库构成、权重与
+    实际出率、去重前后候选数、保底判定与是否命中、最终结果），供插件层按
+    「调试模式」输出到日志或群内卡片；未抽到图时为 None。
     """
 
     def __init__(
@@ -134,6 +204,8 @@ class QuoteDrawer:
         self.weights = weights or {}
         # 保底：稀有度 -> 每 N 抽必出（0 表示禁用）
         self.pity = pity or {}
+        # 最近一次抽取的调试数据（由 next() 写入）
+        self.last_trace: dict | None = None
 
     def _list_images(self) -> list[str]:
         if not self.group_dir.exists():
@@ -189,6 +261,19 @@ class QuoteDrawer:
         if sum(weights) <= 0:
             return random.choice(rarities)
         return random.choices(rarities, weights=weights, k=1)[0]
+
+    def _rarity_shares(self, pools: dict[int, list[str]]) -> dict[int, float]:
+        """本次抽取里各星级的实际出率（只在「有图的星级」间归一化）。
+
+        与 `_pick_rarity` 的口径保持一致：权重全为 0 时回退为均匀。
+        """
+        rarities = sorted(pools)
+        if not rarities:
+            return {}
+        total = sum(self._weight_of(r) for r in rarities)
+        if total <= 0:
+            return {r: 1.0 / len(rarities) for r in rarities}
+        return {r: self._weight_of(r) / total for r in rarities}
 
     @staticmethod
     def _pity_rarity(present: set[int], min_rarity: int) -> int | None:
@@ -246,6 +331,7 @@ class QuoteDrawer:
         只在可用集合上做有意的偏置）。
         """
         images = self._list_images()
+        self.last_trace = None
         if not images:
             return None
 
@@ -264,10 +350,12 @@ class QuoteDrawer:
             thr = int(self.pity.get(r, 0) or 0)
             if thr > 0:
                 since[r] = min(since.get(r, 0) + 1, thr)
+        since_used = dict(since)  # 本次保底判定依据（调试展示用）
 
         # 保底判定：从高星到低星依次检查，优先命中等级最高的保底
         target_rarity: int | None = None
         triggered_r = 0
+        skipped: list[int] = []
         for r in (5, 4, 3, 2, 1):
             thr = int(self.pity.get(r, 0) or 0)
             if thr <= 0 or since.get(r, 0) < thr:
@@ -276,6 +364,7 @@ class QuoteDrawer:
             if picked is None:
                 # 本群没有该档及以上的图：钳制计数、跳过该档（等有图立即触发）
                 since[r] = thr
+                skipped.append(r)
                 continue
             target_rarity = picked
             triggered_r = r
@@ -306,6 +395,30 @@ class QuoteDrawer:
                 "recent": recent,
             }
         )
+        self.last_trace = {
+            "group": self.group_dir.name,
+            "total": len(images),
+            "counts": {r: len(pools.get(r, [])) for r in (1, 2, 3, 4, 5)},
+            "weights": {r: self._weight_of(r) for r in (1, 2, 3, 4, 5)},
+            "share": self._rarity_shares(pools),
+            "window": self.window,
+            "recent": list(recent),
+            "rarity_by_weight": rarity_by_weight,
+            "rarity_final": target_rarity,
+            "pool_size": len(pool_all),
+            "candidates": len(pool),
+            "excluded": len(avoid),
+            "pity": {
+                "thresholds": {
+                    r: int(self.pity.get(r, 0) or 0) for r in (1, 2, 3, 4, 5)
+                },
+                "since_used": dict(since_used),
+                "since_after": {r: since.get(r, 0) for r in (1, 2, 3, 4, 5)},
+                "triggered": triggered_r or None,
+                "skipped": skipped,
+            },
+            "final": target,
+        }
         if triggered_r:
             logger.info(
                 "保底命中："
@@ -340,6 +453,18 @@ class QuotePlugin(Star):
             self.web_submit_log,
             ["GET"],
             "Get submission log",
+        )
+        context.register_web_api(
+            f"/{PLUGIN_NAME}/group-debug",
+            self.web_get_group_debug,
+            ["GET"],
+            "Get per-group quote settings",
+        )
+        context.register_web_api(
+            f"/{PLUGIN_NAME}/group-debug",
+            self.web_set_group_debug,
+            ["POST"],
+            "Save per-group debug mode",
         )
 
     # ------------------------------------------------------------------ #
@@ -435,6 +560,7 @@ class QuotePlugin(Star):
         data = {
             "mode": int(gs.get("default_submit_mode", 0)),
             "cooldown": int(gs.get("default_cooldown", 10)),
+            "debug_mode": 0,
             "last_poke": 0,
         }
         path = self._settings_path(group_id)
@@ -967,6 +1093,54 @@ class QuotePlugin(Star):
         )
 
     # ------------------------------------------------------------------ #
+    # 调试模式与抽卡入口
+    # ------------------------------------------------------------------ #
+    def _debug_level(self, group_id: str) -> int:
+        """本群调试模式等级：0 关闭 / 1 仅日志 / 2 日志 + 群内卡片附注。
+
+        与 mode / cooldown 一样存在群级 settings.json，因此只影响该群。
+        """
+        try:
+            value = int(self._load_settings(group_id).get("debug_mode", 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+        return max(0, min(2, value))
+
+    def _draw_quote(
+        self, group_id: str, source: str = "", user_id: str = ""
+    ) -> tuple[str | None, str]:
+        """抽一张语录，并按本群调试模式输出本次的概率模型信息。
+
+        返回 (图片路径, 需要附在群内卡片上的调试文本)；调试关闭、未抽到图时
+        第二项为空字符串。指令、戳一戳、AI 抽卡都走这里，保证调试口径一致。
+        """
+        drawer = self._drawer(group_id)
+        path = drawer.next()
+        level = self._debug_level(group_id)
+        if level <= 0 or not drawer.last_trace:
+            return path, ""
+        logger.info(
+            f"[语录调试] 来源={source or '未知'} 用户={user_id or '未知'}\n"
+            f"{format_draw_trace(drawer.last_trace, verbose=True)}"
+        )
+        note = (
+            format_draw_trace(drawer.last_trace, verbose=False)
+            if level >= 2 and path
+            else ""
+        )
+        return path, note
+
+    @staticmethod
+    def _with_debug_note(chain: list, note: str) -> list:
+        """把调试文本并入消息链的文本段（必须留在图片之前）。"""
+        if not note:
+            return chain
+        first = chain[0] if chain else None
+        if isinstance(first, Comp.Plain):
+            return [Comp.Plain(text=f"{note}\n{first.text}"), *chain[1:]]
+        return [Comp.Plain(text=note), *chain]
+
+    # ------------------------------------------------------------------ #
     # 指令：随机查看一条语录
     # ------------------------------------------------------------------ #
     @filter.command("语录", alias={"随机语录"})
@@ -980,9 +1154,11 @@ class QuotePlugin(Star):
             return
 
         group_id = str(event.message_obj.group_id)
-        path = self._drawer(group_id).next()
+        path, debug_note = self._draw_quote(group_id, "指令 /语录", user_id)
         if path:
-            yield event.chain_result(quote_chain(path))
+            yield event.chain_result(
+                self._with_debug_note(quote_chain(path), debug_note)
+            )
         else:
             yield event.plain_result(
                 "⭐本群还没有群友语录哦~\n请发送“/语录投稿+图片”来添加！"
@@ -1061,11 +1237,17 @@ class QuotePlugin(Star):
         mode_text = {0: "关闭", 1: "仅管理员", 2: "全体成员"}.get(
             int(settings.get("mode", 0)), "未知"
         )
+        debug_text = {
+            0: "关闭",
+            1: "仅日志",
+            2: "日志 + 卡片附注",
+        }.get(self._debug_level(group_id), "未知")
         yield event.plain_result(
             f"⭐本群语录状态\n"
             f"  数量：{count} 张\n"
             f"  投稿权限：{mode_text}\n"
-            f"  戳戳冷却：{int(settings.get('cooldown', 10))} 秒"
+            f"  戳戳冷却：{int(settings.get('cooldown', 10))} 秒\n"
+            f"  调试模式：{debug_text}"
         )
         event.stop_event()
 
@@ -1104,6 +1286,42 @@ class QuotePlugin(Star):
             event.stop_event()
             return
         yield event.plain_result(f"⭐戳戳冷却已设置为：{cooldown} 秒")
+        event.stop_event()
+
+    # ------------------------------------------------------------------ #
+    # 指令：调试模式（仅管理员）
+    # ------------------------------------------------------------------ #
+    @filter.command("语录调试", alias={"调试语录", "语录调试模式"})
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
+    async def set_debug_mode(self, event: AstrMessageEvent, mode: str = ""):
+        """查看或设置本群抽卡调试模式：0 关闭 / 1 仅日志 / 2 日志 + 卡片附注"""
+        group_id = str(event.message_obj.group_id)
+        if not mode.strip():
+            level = self._debug_level(group_id)
+            mode_text = {
+                0: "关闭",
+                1: "仅写入 AstrBot 日志",
+                2: "写入日志，并在语录卡片上附注（群内可见）",
+            }.get(level, "未知")
+            yield event.plain_result(
+                f"⭐本群语录调试模式：{level}（{mode_text}）\n"
+                "用法：/语录调试 <0|1|2>（只影响本群）\n"
+                "  0：关闭\n"
+                "  1：每次抽卡把出率、去重与保底判定写入日志\n"
+                "  2：额外把简版调试信息附在语录卡片上"
+            )
+            event.stop_event()
+            return
+
+        ok, text = self._apply_group_settings(group_id, debug_mode=mode.strip())
+        if not ok:
+            yield event.plain_result(f"⭐{text}\n用法：/语录调试 <0|1|2>")
+            event.stop_event()
+            return
+        yield event.plain_result(
+            f"⭐本群语录调试模式已设置为：{self._debug_level(group_id)}"
+        )
         event.stop_event()
 
     # ------------------------------------------------------------------ #
@@ -1326,9 +1544,11 @@ class QuotePlugin(Star):
         gs = self._load_global_settings()
         prob = float(gs.get("poke_quote_probability", 0.85))
         if random.random() < prob:
-            path = self._drawer(group_id).next()
+            path, debug_note = self._draw_quote(group_id, "戳一戳", str(sender_id))
             if path:
-                yield event.chain_result(quote_chain(path))
+                yield event.chain_result(
+                    self._with_debug_note(quote_chain(path), debug_note)
+                )
                 event.stop_event()
             # 无语录时静默
             return
@@ -1373,7 +1593,8 @@ class QuotePlugin(Star):
             f"本群语录共 {len(files)} 张\n"
             f"稀有度分布：{rarity_text}\n"
             f"投稿权限：{mode_text}\n"
-            f"戳戳冷却：{int(settings.get('cooldown', 10))} 秒"
+            f"戳戳冷却：{int(settings.get('cooldown', 10))} 秒\n"
+            f"调试模式：{self._debug_level(group_id)}"
         )
 
     def _apply_group_settings(
@@ -1381,8 +1602,9 @@ class QuotePlugin(Star):
         group_id: str,
         mode: int | None = None,
         cooldown: int | None = None,
+        debug_mode: int | None = None,
     ) -> tuple[bool, str]:
-        """校验并更新本群投稿模式与戳戳冷却。"""
+        """校验并更新本群投稿模式、戳戳冷却与调试模式。"""
         settings = self._load_settings(group_id)
         try:
             if mode is not None:
@@ -1395,6 +1617,11 @@ class QuotePlugin(Star):
                 if cooldown < 0:
                     return False, "戳戳冷却不能为负数"
                 settings["cooldown"] = cooldown
+            if debug_mode is not None:
+                debug_mode = int(debug_mode)
+                if debug_mode not in (0, 1, 2):
+                    return False, "调试模式只能是 0、1、2"
+                settings["debug_mode"] = debug_mode
         except (TypeError, ValueError):
             return False, "群设置项必须是整数"
         self._save_settings(group_id, settings)
@@ -1466,6 +1693,9 @@ class QuotePlugin(Star):
                         if value < 0:
                             return False, f"{key} 不能为负", cur
                         cur.setdefault("pity_config", {})[key] = value
+            if "debug_mode" in payload:
+                # 调试模式自 v2.2 起按群保存，这里显式拒绝以免静默丢失
+                return False, "调试模式是按群设置，请用 /语录调试 或 quote_configure_group", cur
         except (TypeError, ValueError):
             return False, "设置项类型无效", cur
 
@@ -1674,21 +1904,23 @@ class QuotePlugin(Star):
         event: AstrMessageEvent,
         mode: int | None = None,
         cooldown: int | None = None,
+        debug_mode: int | None = None,
     ):
-        """调整当前群投稿模式或戳戳冷却，仅 bot 管理员可执行。
+        """调整当前群投稿模式、戳戳冷却或调试模式，仅 bot 管理员可执行。
 
         Args:
             mode(number): 可选，投稿模式，0关闭、1仅管理员、2全体成员
             cooldown(number): 可选，戳戳冷却秒数，不能为负数
+            debug_mode(number): 可选，本群抽卡调试模式，0关闭、1仅写入日志、2日志并在卡片上附注
         """
         group_id = self._tool_group_id(event)
         if not group_id:
             return "语录系统仅支持群聊使用。"
         if not self._is_admin(event):
             return "权限不足，仅 bot 管理员可调整群设置。"
-        if mode is None and cooldown is None:
-            return "请至少提供 mode 或 cooldown 其中一项。"
-        ok, text = self._apply_group_settings(group_id, mode, cooldown)
+        if mode is None and cooldown is None and debug_mode is None:
+            return "请至少提供 mode、cooldown 或 debug_mode 其中一项。"
+        ok, text = self._apply_group_settings(group_id, mode, cooldown, debug_mode)
         return text
 
     @filter.llm_tool(name="quote_configure_global")
@@ -1697,6 +1929,8 @@ class QuotePlugin(Star):
 
         Args:
             settings(object): 可包含投稿模式、冷却、触发概率、去重窗口、权重与保底配置
+
+        注意：抽卡调试模式是按群设置，请用 quote_configure_group 的 debug_mode。
         """
         if not self._is_admin(event):
             return "权限不足，仅 bot 管理员可调整全局设置。"
@@ -1732,6 +1966,36 @@ class QuotePlugin(Star):
         if not ok:
             return error_response(text)
         return json_response(settings)
+
+    def _group_debug_payload(self, group_id: str) -> dict:
+        """返回指定群的设置快照，供 Page 的按群调试面板展示。"""
+        settings = self._load_settings(group_id)
+        return {
+            "group_id": group_id,
+            "debug_mode": self._debug_level(group_id),
+            "mode": int(settings.get("mode", 0)),
+            "cooldown": int(settings.get("cooldown", 10)),
+        }
+
+    async def web_get_group_debug(self):
+        """按群号读取群设置（调试模式 + 投稿权限 + 戳戳冷却）。"""
+        group_id = str(request.query.get("group_id") or "").strip()
+        if not group_id.isdigit():
+            return error_response("请填写数字群号")
+        return json_response(self._group_debug_payload(group_id))
+
+    async def web_set_group_debug(self):
+        """按群保存调试模式，复用 _apply_group_settings 的校验。"""
+        payload = await request.json(default={})
+        group_id = str(payload.get("group_id") or "").strip()
+        if not group_id.isdigit():
+            return error_response("请填写数字群号")
+        ok, text = self._apply_group_settings(
+            group_id, debug_mode=payload.get("debug_mode")
+        )
+        if not ok:
+            return error_response(text)
+        return json_response(self._group_debug_payload(group_id))
 
     async def web_submit_log(self):
         """返回投稿日志（JSONL 解析），支持按群号过滤和限制条数。"""
