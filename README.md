@@ -130,6 +130,11 @@ data/plugin_data/quote_collocter/
 > 版本号说明：本仓库是自用 fork，把 fork 时的上游 `v2.1.1` 记为自用线 **0.1** 基线，
 > 之后按两位数字递增（0.2、0.3、1.0…）。上游历史版本保留在下方备查。
 
+### 1.0
+- 新增本地测试套件 `tests/`（桩化 AstrBot，55 个用例：抽卡概率模型 + 指令/调试/投稿/AI Tools/Web API），并补充「本地测试」一节。
+- 新增源码解析文档 `analysis/implementation-and-probability.md`：README 功能与代码位置对照、概率机制拆解、实测数据与已知问题清单。
+- 新增 Contributors 章节。
+
 ### 0.3
 - 新增**按群调试模式**（`/语录调试 <0|1|2>`、WebUI Page「按群调试模式」、AI `quote_configure_group` 的 `debug_mode`）：可把每次抽卡的图库构成、权重与实际出率、去重候选、保底判定与是否命中写入日志，档位 `2` 还会在语录卡片上附注简版信息。档位存在群级 `settings.json`，只影响该群；`/语录状态` 与 AI 状态查询会显示本群档位。
 - 新增两个 Web API：`GET/POST /quote_collocter/group-debug`（按群查询/保存调试模式）。
@@ -163,6 +168,43 @@ data/plugin_data/quote_collocter/
 
 ### v1.5
 - 支持引用回复投稿、本地缓存/API/URL 三级容错下载、主动 `/语录` 指令。
+
+## 本地测试
+
+插件自带一套**不需要 AstrBot** 的测试（`tests/` 目录，纯标准库）：
+
+```bash
+# 全部测试（55 个用例）
+python3 -m unittest discover -s tests
+
+# 只跑抽卡概率模型（出率、去重、保底、状态文件兼容性）
+python3 tests/test_draw_probability.py
+
+# 只跑插件功能（指令、按群调试、投稿全流程、AI Tools、Web API）
+python3 tests/test_plugin_logic.py
+```
+
+`tests/stub_astrbot.py` 是最小 AstrBot 桩（消息组件、`filter` 装饰器、`Star`/`Context`、`astrbot.api.web`、`logger`），
+它让 `main.py` 能在本地被导入并调用真实 handler；测试会在临时目录里建图库和 data 目录，不污染仓库。
+
+改动代码后建议先跑：
+
+```bash
+python3 -m py_compile main.py && python3 -c "import json;json.load(open('_conf_schema.json'))"
+node --check pages/admin/app.js          # 需要 Node.js
+python3 -m unittest discover -s tests
+```
+
+桩测试覆盖不到的部分需要在真实环境验证：指令前缀与权限装饰器、AstrBot 事件分发（戳一戳通知）、
+真实图片下载（本地缓存/协议端 API/URL 三级容错）、WebUI Page 的 iframe bridge、以及实际发消息。
+真实环境验证步骤：把插件目录放进 AstrBot 的 `data/plugins/`，重载插件，在群里发 `/语录调试 2`
+后抽一次卡，检查卡片附注与日志（或 `/语录调试 1` 只看日志）。
+
+## Contributors
+
+- **TKStudio** — 原作者（[上游仓库](https://github.com/liuziheng20091106/astrbot_plugin_quote_collocter_lzx)）
+- **SirTamago** — 本 fork 维护者（[本仓库](https://github.com/SirTamago/astrbot_plugin_quote_collocter_rimielabot)）
+- **DeepSeek Harness（AI 编码助手）** — 抽卡模型重构（独立同分布 + 保底/权重/去重修复）、按群调试模式、源码解析文档与本地测试套件
 
 ## 注意事项
 

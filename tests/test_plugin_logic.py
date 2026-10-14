@@ -1,0 +1,467 @@
+"""插件功能集成测试：用 stub_astrbot 桩导入 main.py 后调用真实 handler。
+
+覆盖：按群调试模式、群设置指令、抽卡指令、戳一戳、黑名单、
+投稿→改名→改稀有→删除/撤回全流程、AI Tools 权限、Web API。
+
+运行：
+    python3 tests/test_plugin_logic.py
+    # 或
+    python3 -m unittest discover -s tests -v
+"""
+
+from __future__ import annotations
+
+import json
+import shutil
+import unittest
+from pathlib import Path
+
+from stub_astrbot import (
+    AiocqhttpMessageEvent,
+    AstrMessageEvent,
+    Context,
+    Image,
+    Reply,
+    drive,
+    install,
+    run,
+)
+
+ENV = install()  # 必须在 import main 之前
+
+import main as M  # noqa: E402
+
+ADMIN = "10001"
+MEMBER = "20002"
+GROUP = "123456"
+OTHER_GROUP = "654321"
+
+
+def event(user=MEMBER, group=GROUP, message=None, raw=None, text="", responses=None):
+    return AstrMessageEvent(
+        group_id=group,
+        user_id=user,
+        message=message or [],
+        raw_message=raw,
+        message_str=text,
+        responses=responses,
+    )
+
+
+def poke_event(user=MEMBER, group=GROUP):
+    raw = {
+        "post_type": "notice",
+        "notice_type": "notify",
+        "sub_type": "poke",
+        "self_id": "99999",
+        "user_id": user,
+        "target_id": "99999",
+        "group_id": group,
+    }
+    return AstrMessageEvent(
+        group_id=group, user_id=user, raw_message=raw, bot_id="99999"
+    )
+
+
+def first_text(results):
+    for kind, payload in results:
+        if kind == "plain":
+            return payload
+    return ""
+
+
+class PluginTestBase(unittest.TestCase):
+    def setUp(self):
+        shutil.rmtree(ENV.data_root, ignore_errors=True)
+        ENV.logger.records.clear()
+        ENV.request.reset()
+        self.ctx = Context(admins=[ADMIN])
+        self.plugin = M.QuotePlugin(self.ctx, {})
+
+    # 便捷断言
+    def assertOk(self, result):
+        self.assertTrue(result[0], f"应当成功，实际返回：{result}")
+
+    def assertFail(self, result, keyword=""):
+        self.assertFalse(result[0], f"应当失败，实际返回：{result}")
+        if keyword:
+            self.assertIn(keyword, result[1])
+
+
+class DebugModeTest(PluginTestBase):
+    def test_debug_mode_is_per_group(self):
+        self.assertOk(self.plugin._apply_group_settings(GROUP, debug_mode=2))
+        self.assertEqual(self.plugin._debug_level(GROUP), 2)
+        self.assertEqual(self.plugin._debug_level(OTHER_GROUP), 0)
+        settings = ENV.read_json(ENV.group_dir(GROUP) / "settings.json")
+        self.assertEqual(settings["debug_mode"], 2)
+        self.assertFalse((ENV.group_dir(OTHER_GROUP) / "settings.json").exists())
+
+    def test_invalid_debug_mode_is_rejected(self):
+        self.plugin._apply_group_settings(GROUP, debug_mode=2)
+        self.assertFail(self.plugin._apply_group_settings(GROUP, debug_mode=5))
+        self.assertFail(self.plugin._apply_group_settings(GROUP, debug_mode="abc"))
+        self.assertEqual(self.plugin._debug_level(GROUP), 2)  # 未被写坏
+
+    def test_global_settings_reject_debug_mode(self):
+        ok, text, _ = self.plugin._apply_global_settings({"debug_mode": 1})
+        self.assertFalse(ok)
+        self.assertIn("按群设置", text)
+        self.assertNotIn("debug_mode", self.plugin._load_global_settings())
+
+    def test_draw_output_respects_group_level(self):
+        for group in (GROUP, OTHER_GROUP):
+            ENV.put_image(group, "3.demo.jpg")
+        self.plugin._apply_group_settings(GROUP, debug_mode=2)
+
+        path, note = self.plugin._draw_quote(GROUP, "指令 /语录", MEMBER)
+        self.assertTrue(path)
+        self.assertIn("语录调试", note)
+        self.assertIn("保底：", note)
+        self.assertIn(f"群{GROUP}", ENV.logger.text())
+
+        ENV.logger.records.clear()
+        path2, note2 = self.plugin._draw_quote(OTHER_GROUP, "指令 /语录", MEMBER)
+        self.assertTrue(path2)
+        self.assertEqual(note2, "")  # 其它群不受影响
+        self.assertNotIn("语录调试", ENV.logger.text())
+
+    def test_debug_note_stays_before_image(self):
+        ENV.put_image(GROUP, "3.demo.jpg")
+        target = self.plugin._find_quote_file(GROUP, "demo")
+        chain = self.plugin._with_debug_note(M.quote_chain(str(target)), "DBG-HEAD")
+        self.assertEqual(len(chain), 2)
+        self.assertEqual(chain[0].text.splitlines()[0], "DBG-HEAD")
+        self.assertIn("demo.jpg", chain[0].text)  # 原卡片文字仍在
+        self.assertIsInstance(chain[1], Image)  # 图片仍在最后
+        # 空附注不改变消息链
+        self.assertEqual(self.plugin._with_debug_note(chain, ""), chain)
+
+    def test_command_sets_current_group(self):
+        results = drive(self.plugin.set_debug_mode(event(user=ADMIN), "1"))
+        self.assertIn("本群语录调试模式已设置为：1", first_text(results))
+        self.assertEqual(self.plugin._debug_level(GROUP), 1)
+
+        results = drive(self.plugin.set_debug_mode(event(user=ADMIN), "9"))
+        self.assertIn("调试模式只能是 0、1、2", first_text(results))
+        self.assertEqual(self.plugin._debug_level(GROUP), 1)
+
+        results = drive(self.plugin.set_debug_mode(event(user=ADMIN), ""))
+        self.assertIn("用法：/语录调试", first_text(results))
+
+    def test_status_shows_debug_level(self):
+        self.plugin._apply_group_settings(GROUP, debug_mode=2)
+        results = drive(self.plugin.quote_status(event()))
+        self.assertIn("调试模式：日志 + 卡片附注", first_text(results))
+        self.assertIn("调试模式：2", self.plugin._quote_stats_text(GROUP))
+
+
+class CommandTest(PluginTestBase):
+    def test_group_settings_commands(self):
+        self.assertIn("投稿权限已设置为：全体成员",
+                      first_text(drive(self.plugin.set_submit_mode(event(user=ADMIN), 2))))
+        self.assertEqual(self.plugin._load_settings(GROUP)["mode"], 2)
+
+        self.assertIn("戳戳冷却已设置为：5 秒",
+                      first_text(drive(self.plugin.set_poke_cooldown(event(user=ADMIN), 5))))
+        self.assertEqual(self.plugin._load_settings(GROUP)["cooldown"], 5)
+
+        self.assertIn("模式只能是 0、1、2",
+                      first_text(drive(self.plugin.set_submit_mode(event(user=ADMIN), 9))))
+
+    def test_random_quote_returns_chain(self):
+        ENV.put_image(GROUP, "5.only.jpg")
+        results = drive(self.plugin.random_quote(event()))
+        self.assertEqual(results[0][0], "chain")
+        chain = results[0][1]
+        self.assertIsInstance(chain[0], M.Comp.Plain)
+        self.assertIsInstance(chain[-1], M.Comp.Image)
+        self.assertIn("SSSR", chain[0].text)
+
+    def test_random_quote_empty_library(self):
+        results = drive(self.plugin.random_quote(event()))
+        self.assertIn("本群还没有群友语录", first_text(results))
+
+    def test_blacklist_blocks_draw(self):
+        ENV.put_image(GROUP, "1.a.jpg")
+        self.plugin._update_blacklist("block", MEMBER)
+        self.assertTrue(self.plugin._is_blocked_user(MEMBER))
+        results = drive(self.plugin.random_quote(event(user=MEMBER)))
+        self.assertIn("已被语录系统拉黑", first_text(results))
+        # 解封后恢复
+        self.plugin._update_blacklist("unblock", MEMBER)
+        results = drive(self.plugin.random_quote(event(user=MEMBER)))
+        self.assertEqual(results[0][0], "chain")
+
+    def test_block_command_resolves_at_or_uid(self):
+        results = drive(self.plugin.block_quote_user(event(user=ADMIN, message=[
+            M.Comp.At(qq=MEMBER)
+        ]), ""))
+        self.assertIn("已全局拉黑用户", first_text(results))
+        self.assertTrue(self.plugin._is_blocked_user(MEMBER))
+        results = drive(self.plugin.unblock_quote_user(event(user=ADMIN), MEMBER))
+        self.assertIn("已解除用户", first_text(results))
+
+
+class PokeTest(PluginTestBase):
+    def test_poke_draws_then_cooldown_blocks(self):
+        ENV.put_image(GROUP, "3.demo.jpg")
+        self.plugin._apply_global_settings({"poke_quote_probability": 1.0})
+        self.plugin._apply_group_settings(GROUP, cooldown=60)
+        self.plugin._drawers.clear()
+
+        first = drive(self.plugin.on_poke(poke_event()))
+        self.assertEqual(first[0][0], "chain")
+
+        second = drive(self.plugin.on_poke(poke_event()))
+        self.assertEqual(second, [])  # 冷却中，静默
+
+    def test_blocked_user_poke_is_ignored_without_consuming_cooldown(self):
+        ENV.put_image(GROUP, "3.demo.jpg")
+        self.plugin._apply_global_settings({"poke_quote_probability": 1.0})
+        self.plugin._update_blacklist("block", MEMBER)
+
+        self.assertEqual(drive(self.plugin.on_poke(poke_event(user=MEMBER))), [])
+        self.assertEqual(self.plugin._load_settings(GROUP)["last_poke"], 0)
+
+    def test_poke_only_reacts_to_bot_target(self):
+        ENV.put_image(GROUP, "3.demo.jpg")
+        self.plugin._apply_global_settings({"poke_quote_probability": 1.0})
+        raw = {
+            "post_type": "notice", "notice_type": "notify", "sub_type": "poke",
+            "self_id": "99999", "user_id": MEMBER, "target_id": MEMBER,
+            "group_id": GROUP,
+        }
+        ev = AstrMessageEvent(group_id=GROUP, user_id=MEMBER, raw_message=raw, bot_id="99999")
+        self.assertEqual(drive(self.plugin.on_poke(ev)), [])
+
+    def test_probability_zero_always_sends_fun_text(self):
+        ENV.put_image(GROUP, "3.demo.jpg")
+        self.plugin._apply_global_settings({"poke_quote_probability": 0.0})
+        results = drive(self.plugin.on_poke(poke_event()))
+        self.assertEqual(results[0][0], "chain")
+        chain = results[0][1]
+        self.assertIsInstance(chain[0], M.Comp.At)
+        self.assertIn(chain[1].text, M.POKE_TEXTS)
+
+
+class SubmissionTest(PluginTestBase):
+    def _submit(self, title, user=MEMBER, group=GROUP):
+        src = ENV.workdir / "src.png"
+        src.write_bytes(b"png-bytes")
+        ev = AiocqhttpMessageEvent(
+            group_id=group,
+            user_id=user,
+            message=[Reply(id="55"), Image(path=str(src))],
+            responses={
+                "get_msg": {
+                    "message": [
+                        {"type": "image", "data": {"file": "a.png", "url": "http://x/a.png"}}
+                    ]
+                }
+            },
+        )
+        return run(self.plugin._submit_replied_quote(ev, group, user, title))
+
+    def test_submit_requires_mode(self):
+        self.assertFail(self._submit("标题"), "投稿系统未开启")
+        self.plugin._apply_group_settings(GROUP, mode=2)
+        ok, text = self._submit("标题")
+        self.assertTrue(ok, text)
+        self.assertTrue((ENV.group_dir(GROUP) / "1.标题.png").exists())
+        record = self.plugin._find_submission_record(GROUP, "1.标题.png")
+        self.assertEqual(record["user_id"], MEMBER)
+
+    def test_duplicate_title_rejected(self):
+        self.plugin._apply_group_settings(GROUP, mode=2)
+        self.assertTrue(self._submit("重名")[0])
+        ok, text = self._submit("重名")
+        self.assertFalse(ok)
+        self.assertIn("已存在同名语录", text)
+
+    def test_rename_rarity_delete_keep_log_in_sync(self):
+        self.plugin._apply_group_settings(GROUP, mode=2)
+        self.assertTrue(self._submit("旧标题")[0])
+        target = ENV.group_dir(GROUP) / "1.旧标题.png"
+
+        ok, _ = self.plugin._rename_quote_file(GROUP, target, "新标题")
+        self.assertTrue(ok)
+        renamed = ENV.group_dir(GROUP) / "1.新标题.png"
+        self.assertTrue(renamed.exists())
+        self.assertIsNone(self.plugin._find_submission_record(GROUP, "1.旧标题.png"))
+        self.assertIsNotNone(self.plugin._find_submission_record(GROUP, "1.新标题.png"))
+
+        ok, _ = self.plugin._set_quote_rarity_file(GROUP, renamed, 5)
+        self.assertTrue(ok)
+        rare = ENV.group_dir(GROUP) / "5.新标题.png"
+        self.assertTrue(rare.exists())
+        self.assertIsNotNone(self.plugin._find_submission_record(GROUP, "5.新标题.png"))
+
+        ok, _ = self.plugin._delete_quote_file(GROUP, rare)
+        self.assertTrue(ok)
+        self.assertFalse(rare.exists())
+        self.assertIsNone(self.plugin._find_submission_record(GROUP, "5.新标题.png"))
+        self.assertEqual(self.plugin._read_submit_log(), [])
+
+    def test_revoke_only_owner(self):
+        self.plugin._apply_group_settings(GROUP, mode=2)
+        self.assertTrue(self._submit("我的投稿")[0])
+        target = ENV.group_dir(GROUP) / "1.我的投稿.png"
+
+        ok, text = self.plugin._revoke_quote_file(GROUP, ADMIN, target)
+        self.assertFalse(ok)
+        self.assertIn("只能撤回自己投的语录", text)
+        self.assertTrue(target.exists())
+
+        ok, text = self.plugin._revoke_quote_file(GROUP, MEMBER, target)
+        self.assertTrue(ok, text)
+        self.assertFalse(target.exists())
+
+    def test_reply_based_delete_resolves_card(self):
+        ENV.put_image(GROUP, "1.卡片.png")
+        ev = event(user=ADMIN, message=[Reply(id="77")], responses={
+            "get_msg": {"message": [
+                {"type": "text", "data": {"text": "您抽到了新卡\n卡片.png"}}
+            ]}
+        })
+        results = drive(self.plugin.delete_quote(ev, ""))
+        self.assertIn("已删除语录", first_text(results))
+        self.assertFalse((ENV.group_dir(GROUP) / "1.卡片.png").exists())
+
+    def test_find_quote_file_matches_several_forms(self):
+        self.plugin._apply_group_settings(GROUP, mode=2)
+        self.plugin._ensure_group_dir(GROUP)
+        (ENV.group_dir(GROUP) / "3.杰克的比喻.jpg").write_bytes(b"x")
+        for query in ("3.杰克的比喻.jpg", "杰克的比喻.jpg", "杰克的比喻"):
+            found = self.plugin._find_quote_file(GROUP, query)
+            self.assertIsNotNone(found, f"应当能按 {query!r} 找到")
+            self.assertEqual(found.name, "3.杰克的比喻.jpg")
+        self.assertIsNone(self.plugin._find_quote_file(GROUP, "不存在"))
+        self.assertEqual(M.parse_quote_rarity("3.杰克的比喻.jpg"), (3, "杰克的比喻.jpg"))
+
+
+class AiToolTest(PluginTestBase):
+    def setUp(self):
+        super().setUp()
+        self.plugin._apply_group_settings(GROUP, mode=2, debug_mode=1)
+        ENV.put_image(GROUP, "3.甲.jpg")
+        ENV.put_image(GROUP, "5.乙.jpg")
+        self.admin_ev = event(user=ADMIN)
+        self.member_ev = event(user=MEMBER)
+
+    def test_list_and_view(self):
+        text = run(self.plugin.ai_quote_list(self.admin_ev, 0, 1, 10))
+        self.assertIn("语录列表：共 2 张", text)
+        self.assertIn("[3星] 甲.jpg", text)
+        self.assertNotIn(str(ENV.data_root), text)  # 不泄露本地路径
+
+        text = run(self.plugin.ai_quote_list(self.admin_ev, 5, 1, 10))
+        self.assertIn("筛选 5 星", text)
+
+        text = run(self.plugin.ai_quote_view(self.admin_ev, "乙"))
+        self.assertIn("恭喜抽到SSSR卡", text)
+
+    def test_status(self):
+        text = run(self.plugin.ai_quote_status(self.member_ev))
+        self.assertIn("本群语录共 2 张", text)
+        self.assertIn("调试模式：1", text)
+
+    def test_writes_require_admin(self):
+        self.assertEqual(run(self.plugin.ai_quote_delete(self.member_ev, "甲")),
+                         "权限不足，仅 bot 管理员可删除语录。")
+        self.assertIn("权限不足", run(self.plugin.ai_quote_rename(self.member_ev, "甲", "丙")))
+        self.assertIn("权限不足", run(self.plugin.ai_quote_configure_group(self.member_ev, 2, None, None)))
+        self.assertIn("权限不足", run(self.plugin.ai_quote_manage_blacklist(self.member_ev, "block", MEMBER)))
+
+        self.assertIn("已删除", run(self.plugin.ai_quote_delete(self.admin_ev, "甲")))
+        self.assertFalse((ENV.group_dir(GROUP) / "3.甲.jpg").exists())
+
+    def test_configure_group_debug_mode(self):
+        self.assertIn("群设置已保存",
+                      run(self.plugin.ai_quote_configure_group(self.admin_ev, None, None, 2)))
+        self.assertEqual(self.plugin._debug_level(GROUP), 2)
+        self.assertIn("请至少提供",
+                      run(self.plugin.ai_quote_configure_group(self.admin_ev, None, None, None)))
+
+    def test_draw_sends_card_and_returns_text(self):
+        ev = event(user=ADMIN)
+        text = run(self.plugin.ai_quote_draw(ev))
+        self.assertEqual(text, "已完成抽卡并发送到群内。")
+        self.assertEqual(len(ev.sent), 1)
+        self.assertEqual(ev.sent[0][0], "chain")
+        # 该群档位为 1（仅日志）：卡片上不应有附注，但日志里应有
+        self.assertNotIn("语录调试", ev.sent[0][1][0].text)
+        self.assertIn("语录调试", ENV.logger.text())
+
+    def test_draw_with_debug_two_attaches_note(self):
+        self.plugin._apply_group_settings(GROUP, debug_mode=2)
+        ev = event(user=ADMIN)
+        run(self.plugin.ai_quote_draw(ev))
+        self.assertIn("语录调试", ev.sent[0][1][0].text)
+
+    def test_submit_tool_permission(self):
+        text = run(self.plugin.ai_quote_submit(self.member_ev, "标题"))
+        self.assertIn("请回复一条含图消息", text)
+
+    def test_blacklisted_user_cannot_use_tools(self):
+        self.plugin._update_blacklist("block", MEMBER)
+        self.assertIn("拉黑", run(self.plugin.ai_quote_list(self.member_ev, 0, 1, 10)))
+
+
+class WebApiTest(PluginTestBase):
+    def test_routes_registered(self):
+        self.assertEqual(len(self.ctx.apis), 5)
+        self.assertIn(("/quote_collocter/group-debug", ["GET"]), self.ctx.apis)
+        self.assertIn(("/quote_collocter/group-debug", ["POST"]), self.ctx.apis)
+
+    def test_group_debug_get_and_post(self):
+        self.plugin._apply_group_settings(GROUP, debug_mode=2)
+        ENV.request.reset({"group_id": GROUP})
+        data = run(self.plugin.web_get_group_debug())["ok"]
+        self.assertEqual(data["debug_mode"], 2)
+        self.assertEqual(data["group_id"], GROUP)
+
+        ENV.request.reset({}, {"group_id": OTHER_GROUP, "debug_mode": 1})
+        data = run(self.plugin.web_set_group_debug())["ok"]
+        self.assertEqual(data["debug_mode"], 1)
+        self.assertEqual(self.plugin._debug_level(OTHER_GROUP), 1)
+
+        ENV.request.reset({"group_id": "abc"})
+        self.assertIn("err", run(self.plugin.web_get_group_debug()))
+
+        ENV.request.reset({}, {"group_id": GROUP, "debug_mode": 9})
+        self.assertIn("err", run(self.plugin.web_set_group_debug()))
+
+    def test_settings_get_and_save(self):
+        ENV.request.reset()
+        data = run(self.plugin.web_get_settings())["ok"]
+        self.assertNotIn("debug_mode", data)  # 已改为按群
+
+        ENV.request.reset({}, {"recent_window": 0, "poke_quote_probability": 0.5})
+        saved = run(self.plugin.web_save_settings())["ok"]
+        self.assertEqual(saved["recent_window"], 0)
+        self.assertEqual(self.plugin._load_global_settings()["recent_window"], 0)
+
+        ENV.request.reset({}, {"recent_window": -1})
+        self.assertIn("err", run(self.plugin.web_save_settings()))
+
+    def test_submit_log_filter_and_limit(self):
+        # 造 3 条日志：GROUP 两条、OTHER_GROUP 一条
+        for i in range(2):
+            self.plugin._log_submission(GROUP, MEMBER, f"1.x{i}.jpg", 100 + i)
+        self.plugin._log_submission(OTHER_GROUP, ADMIN, "1.y.jpg", 300)
+
+        ENV.request.reset({"group_id": GROUP})
+        data = run(self.plugin.web_submit_log())["ok"]
+        self.assertEqual(data["total"], 2)
+        self.assertTrue(all(r["group_id"] == GROUP for r in data["items"]))
+        # 倒序
+        self.assertEqual(data["items"][0]["filename"], "1.x1.jpg")
+
+        ENV.request.reset({"limit": 1})
+        data = run(self.plugin.web_submit_log())["ok"]
+        self.assertEqual(data["total"], 1)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
