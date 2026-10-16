@@ -1,7 +1,8 @@
 # 会话工作记录（0.1 → 1.0 及 devlog 基建）
 
 > 本文件由 GitHub App 机器人 `dsh-rimielab[bot]` 记录，内容与 devlog issue
-> [#2](https://github.com/SirTamago/astrbot_plugin_quote_collocter_rimielabot/issues/2) 的逐轮评论一致，
+> [#1 📓 Devlog — 工作记录](https://github.com/SirTamago/astrbot_plugin_quote_collocter_rimielabot/issues/1) 里
+> 「补录总览（合并自 issue #2）」及其后的 R1–R8 评论一致，
 > 目的是让改动细节随仓库一起走（不依赖 issue 是否可访问）。
 >
 > 配套文档：[implementation-and-probability.md](./implementation-and-probability.md)（README 功能与代码位置对照、
@@ -12,8 +13,9 @@
 ## 索引
 
 本文是本会话（从"检查插件源码"到"devlog 记录闭环"）逐轮改动的详细记录，精确到函数与实现语义，
-与 devlog issue [#2](https://github.com/SirTamago/astrbot_plugin_quote_collocter_rimielabot/issues/2) 的评论一一对应；
-滚动记录（每次 push 一条）在 issue [#1](https://github.com/SirTamago/astrbot_plugin_quote_collocter_rimielabot/issues/1)。
+与 devlog issue [#1](https://github.com/SirTamago/astrbot_plugin_quote_collocter_rimielabot/issues/1) 里的
+「补录总览 + R1–R8」评论一一对应（原本放在 issue #2，后按"单一 devlog issue"的约定合并进 #1，#2 已关闭）。
+滚动记录（每次 push 一条）同样在 issue #1。
 行号如无特别说明，均指当前 `main.py`（2037 行、CRLF）。
 
 | 轮次 | 主题 | 提交 | 版本 |
