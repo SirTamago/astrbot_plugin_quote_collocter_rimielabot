@@ -19,7 +19,7 @@ on:
   workflow_dispatch:        # 也可以在 Actions 页面手动触发一次
     inputs:
       note:
-        description: "手动补录内容（Markdown，留空则只记录 head 信息）"
+        description: "手动补录内容（Markdown；页面输入框是单行，用 \\n 表示换行）"
         required: false
         type: string
 
@@ -125,11 +125,12 @@ jobs:
           set -euo pipefail
 
           if [ -n "${NOTE:-}" ]; then
-            # 手动补录：把 note 原文作为一条工作段记录（工作流上线前的历史用它补）
+            # 手动补录：把 note 原文作为一条工作段记录（工作流上线前的历史用它补）。
+            # 页面输入框是单行，因此只把字面量 \n 还原成换行（不碰 \| 等表格转义）。
             {
               echo "### 工作段 · $(TZ=UTC date '+%Y-%m-%d %H:%M UTC')（手动补录）"
               echo
-              printf '%s\n' "$NOTE"
+              printf '%s\n' "$NOTE" | sed 's/\\n/\n/g'
             } > /tmp/entry.md
           else
             {
