@@ -213,4 +213,5 @@ python3 -m unittest discover -s tests
 
 - 图片投稿没有内容限制，请自行审核。
 - 戳一戳、引用消息读取及本地缓存下载仅 OneBot v11（aiocqhttp）平台支持。
+- **某个群里只有管理员能用、普通成员发指令和戳一戳都没反应**时，先查 AstrBot 的 **ID 白名单**（配置 → 访问控制 → 白名单）：开启白名单且该群不在列表里时，消息在进入插件之前就被丢弃，指令与戳一戳一起失效；`wl_ignore_admin_on_group`（管理员无视群聊白名单）会让管理员仍然正常，容易误判成插件故障。把群号（或 `aiocqhttp:GroupMessage:<群号>`）加进白名单即可，打开 `id_whitelist_log` 后日志会打印 `is not in the session allowlist` 作为确诊依据。
 - AI Tools 是否可用取决于 AstrBot 当前会话是否启用了 Agent/工具调用能力。
