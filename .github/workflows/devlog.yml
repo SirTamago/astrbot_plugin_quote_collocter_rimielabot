@@ -84,12 +84,20 @@ jobs:
           num=$(find_issue)
           if [ -z "$num" ]; then
             echo "没有找到 open 的 $LABEL issue，正在创建…"
-            gh issue create --repo "$GITHUB_REPOSITORY" --label "$LABEL" \
-              --title "$ISSUE_TITLE" --body-file /tmp/header.md
-            num=$(find_issue)
+            url=$(gh issue create --repo "$GITHUB_REPOSITORY" --label "$LABEL" \
+                    --title "$ISSUE_TITLE" --body-file /tmp/header.md | tail -n 1)
+            echo "创建返回: $url"
+            # gh issue create 会把 issue URL 打到 stdout，直接取末尾编号最可靠。
+            # 不能用 gh issue list 复查：它走搜索索引，新建的 issue 会有几秒不可见。
+            num=$(printf '%s' "$url" | grep -oE '[0-9]+$' || true)
+            for _ in 1 2 3 4 5; do
+              if [ -n "$num" ]; then break; fi
+              sleep 3
+              num=$(find_issue)
+            done
           fi
           if [ -z "$num" ]; then
-            echo "::error::创建后仍找不到 devlog issue —— 请确认该仓库已启用 Issues，且 App 已被授权访问该仓库"
+            echo "::error::无法确定 devlog issue 编号 —— 请确认该仓库已启用 Issues，且 App 已被授权访问该仓库"
             exit 1
           fi
           echo "num=$num" >> "$GITHUB_OUTPUT"
