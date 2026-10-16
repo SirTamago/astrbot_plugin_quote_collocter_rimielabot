@@ -17,6 +17,11 @@ on:
   push:
     branches: [main, master]
   workflow_dispatch:        # 也可以在 Actions 页面手动触发一次
+    inputs:
+      note:
+        description: "手动补录内容（Markdown，留空则只记录 head 信息）"
+        required: false
+        type: string
 
 permissions: {}             # 不使用 GITHUB_TOKEN，全部走 App 安装令牌
 
@@ -115,26 +120,36 @@ jobs:
           AFTER: ${{ github.sha }}
           REF: ${{ github.ref_name }}
           COMMITS: ${{ toJSON(github.event.commits) }}
+          NOTE: ${{ github.event.inputs.note }}
         run: |
           set -euo pipefail
 
-          {
-            echo "### 工作段 · $(TZ=UTC date '+%Y-%m-%d %H:%M UTC')"
-            echo
-            if [ "$EVENT" = "workflow_dispatch" ]; then
-              echo "手动触发 ｜ 分支 \`${REF}\` ｜ head \`${AFTER:0:7}\`"
-            else
-              echo "推送者 \`${PUSHER}\` ｜ [\`${BEFORE:0:7}...${AFTER:0:7}\`](${COMPARE})"
-            fi
-            echo
-            echo "| 提交 | 作者 | 说明 |"
-            echo "| --- | --- | --- |"
-            if [ -z "${COMMITS:-}" ] || [ "${COMMITS}" = "null" ] || [ "${COMMITS}" = "[]" ]; then
-              echo "| \`${AFTER:0:7}\` | — | （本次没有提交明细） |"
-            else
-              echo "${COMMITS}" | jq -r '.[] | "| `\(.id[0:7])` | \(.author.name // .author.username // "?") | \(.message | split("\n")[0] | gsub("\\|"; "\\|")) |"'
-            fi
-          } > /tmp/entry.md
+          if [ -n "${NOTE:-}" ]; then
+            # 手动补录：把 note 原文作为一条工作段记录（工作流上线前的历史用它补）
+            {
+              echo "### 工作段 · $(TZ=UTC date '+%Y-%m-%d %H:%M UTC')（手动补录）"
+              echo
+              printf '%s\n' "$NOTE"
+            } > /tmp/entry.md
+          else
+            {
+              echo "### 工作段 · $(TZ=UTC date '+%Y-%m-%d %H:%M UTC')"
+              echo
+              if [ "$EVENT" = "workflow_dispatch" ]; then
+                echo "手动触发 ｜ 分支 \`${REF}\` ｜ head \`${AFTER:0:7}\`"
+              else
+                echo "推送者 \`${PUSHER}\` ｜ [\`${BEFORE:0:7}...${AFTER:0:7}\`](${COMPARE})"
+              fi
+              echo
+              echo "| 提交 | 作者 | 说明 |"
+              echo "| --- | --- | --- |"
+              if [ -z "${COMMITS:-}" ] || [ "${COMMITS}" = "null" ] || [ "${COMMITS}" = "[]" ]; then
+                echo "| \`${AFTER:0:7}\` | — | （本次没有提交明细） |"
+              else
+                echo "${COMMITS}" | jq -r '.[] | "| `\(.id[0:7])` | \(.author.name // .author.username // "?") | \(.message | split("\n")[0] | gsub("\\|"; "\\|")) |"'
+              fi
+            } > /tmp/entry.md
+          fi
 
           gh issue comment "$NUM" --repo "$GITHUB_REPOSITORY" --body-file /tmp/entry.md
           echo "已追加记录到 issue #$NUM"
