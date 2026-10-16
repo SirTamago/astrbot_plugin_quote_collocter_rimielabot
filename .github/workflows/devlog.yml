@@ -22,6 +22,10 @@ on:
         description: "手动补录内容（Markdown；页面输入框是单行，用 \\n 表示换行）"
         required: false
         type: string
+      new_issue_title:
+        description: "填了就新建一个 devlog issue（正文 = note），留空则追加到现有 devlog issue"
+        required: false
+        type: string
 
 permissions: {}             # 不使用 GITHUB_TOKEN，全部走 App 安装令牌
 
@@ -62,6 +66,7 @@ jobs:
         id: boot
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
+          NEW_TITLE: ${{ github.event.inputs.new_issue_title }}
         run: |
           set -euo pipefail
 
@@ -101,14 +106,14 @@ jobs:
               num=$(find_issue)
             done
           fi
-          if [ -z "$num" ]; then
+          if [ -z "$num" ] && [ -z "${NEW_TITLE:-}" ]; then
             echo "::error::无法确定 devlog issue 编号 —— 请确认该仓库已启用 Issues，且 App 已被授权访问该仓库"
             exit 1
           fi
           echo "num=$num" >> "$GITHUB_OUTPUT"
           echo "使用 issue #$num"
 
-      - name: 追加工作段记录
+      - name: 记录工作段（追加评论或新建 issue）
         if: steps.guard.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
@@ -121,6 +126,7 @@ jobs:
           REF: ${{ github.ref_name }}
           COMMITS: ${{ toJSON(github.event.commits) }}
           NOTE: ${{ github.event.inputs.note }}
+          NEW_TITLE: ${{ github.event.inputs.new_issue_title }}
         run: |
           set -euo pipefail
 
@@ -152,5 +158,12 @@ jobs:
             } > /tmp/entry.md
           fi
 
-          gh issue comment "$NUM" --repo "$GITHUB_REPOSITORY" --body-file /tmp/entry.md
-          echo "已追加记录到 issue #$NUM"
+          if [ -n "${NEW_TITLE:-}" ]; then
+            # 新建一个 devlog issue（用于补录/分段记录），正文就是这次要记的内容
+            url=$(gh issue create --repo "$GITHUB_REPOSITORY" --label "$LABEL" \
+                    --title "$NEW_TITLE" --body-file /tmp/entry.md | tail -n 1)
+            echo "已新建 devlog issue: $url"
+          else
+            gh issue comment "$NUM" --repo "$GITHUB_REPOSITORY" --body-file /tmp/entry.md
+            echo "已追加记录到 issue #$NUM"
+          fi
