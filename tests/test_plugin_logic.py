@@ -150,10 +150,18 @@ class DebugModeTest(PluginTestBase):
         results = drive(self.plugin.set_debug_mode(event(user=ADMIN), ""))
         self.assertIn("用法：/语录调试", first_text(results))
 
-    def test_status_shows_debug_level(self):
+    def test_status_lists_every_rarity(self):
         self.plugin._apply_group_settings(GROUP, debug_mode=2)
-        results = drive(self.plugin.quote_status(event()))
-        self.assertIn("调试模式：日志 + 卡片附注", first_text(results))
+        ENV.put_image(GROUP, "6.甲.jpg")
+        ENV.put_image(GROUP, "3.乙.jpg")
+        text = first_text(drive(self.plugin.quote_status(event())))
+        self.assertIn("总数：2 张", text)
+        for rarity in M.RARITY_ORDER:
+            self.assertIn(f"{rarity}★ ", text)
+        self.assertIn("6★ 1 张", text)
+        self.assertIn("3★ 1 张", text)
+        self.assertIn("1★ 0 张", text)   # 空档位也要列出
+        self.assertIn("调试模式：2", text)
         self.assertIn("调试模式：2", self.plugin._quote_stats_text(GROUP))
 
 
@@ -364,7 +372,9 @@ class AiToolTest(PluginTestBase):
 
     def test_status(self):
         text = run(self.plugin.ai_quote_status(self.member_ev))
-        self.assertIn("本群语录共 2 张", text)
+        self.assertIn("总数：2 张", text)
+        self.assertIn("6★ 1 张", text)
+        self.assertIn("1★ 0 张", text)
         self.assertIn("调试模式：1", text)
 
     def test_writes_require_admin(self):

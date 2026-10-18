@@ -1407,34 +1407,12 @@ class QuotePlugin(Star):
     @filter.command("语录状态", alias={"投稿状态"})
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def quote_status(self, event: AstrMessageEvent):
-        """查看本群语录数量、投稿权限与冷却设置"""
+        """查看本群语录总数、各星级张数、投稿权限与冷却设置"""
         group_id = str(event.message_obj.group_id)
-        settings = self._load_settings(group_id)
-        d = self._group_dir(group_id)
-        count = (
-            sum(
-                1
-                for f in d.iterdir()
-                if f.is_file() and f.suffix.lower() in IMAGE_EXTENSIONS
-            )
-            if d.exists()
-            else 0
+        body = "\n".join(
+            f"  {line}" for line in self._quote_stats_text(group_id).splitlines()
         )
-        mode_text = {0: "关闭", 1: "仅管理员", 2: "全体成员"}.get(
-            int(settings.get("mode", 0)), "未知"
-        )
-        debug_text = {
-            0: "关闭",
-            1: "仅日志",
-            2: "日志 + 卡片附注",
-        }.get(self._debug_level(group_id), "未知")
-        yield event.plain_result(
-            f"⭐本群语录状态\n"
-            f"  数量：{count} 张\n"
-            f"  投稿权限：{mode_text}\n"
-            f"  戳戳冷却：{int(settings.get('cooldown', 10))} 秒\n"
-            f"  调试模式：{debug_text}"
-        )
+        yield event.plain_result(f"⭐本群语录状态\n{body}")
         event.stop_event()
 
     # ------------------------------------------------------------------ #
@@ -1762,7 +1740,10 @@ class QuotePlugin(Star):
         return group_id or None
 
     def _quote_stats_text(self, group_id: str) -> str:
-        """生成本群语录统计文本，供指令与 AI tool 使用。"""
+        """生成本群语录统计文本，供指令与 AI tool 共用。
+
+        每个星级单独一行（含 0 张的档位），方便一眼看出哪些档位是空的。
+        """
         files = self._list_quote_files(group_id)
         counts = {rarity: 0 for rarity in RARITY_TEXT}
         for path in files:
@@ -1772,13 +1753,12 @@ class QuotePlugin(Star):
         mode_text = {0: "关闭", 1: "仅管理员", 2: "全体成员"}.get(
             int(settings.get("mode", 0)), "未知"
         )
-        rarity_text = "、".join(
-            f"{RARITY_TEXT[rarity]} {counts[rarity]} 张"
-            for rarity in sorted(counts, reverse=True)
+        rarity_lines = "\n".join(
+            f"{rarity}★ {counts[rarity]} 张" for rarity in RARITY_ORDER
         )
         return (
-            f"本群语录共 {len(files)} 张\n"
-            f"稀有度分布：{rarity_text}\n"
+            f"总数：{len(files)} 张\n"
+            f"{rarity_lines}\n"
             f"投稿权限：{mode_text}\n"
             f"戳戳冷却：{int(settings.get('cooldown', 10))} 秒\n"
             f"调试模式：{self._debug_level(group_id)}"
