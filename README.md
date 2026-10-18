@@ -148,6 +148,10 @@ data/plugin_data/quote_collocter/
 
 ## 版本更新
 
+完整更新日志见仓库根目录的 [`CHANGELOG.md`](CHANGELOG.md)（AstrBot 插件详情页 / 更新弹窗会直接展示它）。
+发布新版本时请同时更新 `CHANGELOG.md` 与 `metadata.yaml` 的 `version`，否则插件管理页检测不到更新。
+
+
 > 版本号说明：本仓库是自用 fork，把 fork 时的上游 `v2.1.1` 记为自用线 **0.1** 基线，
 > 之后按两位数字递增（0.2、0.3、1.0…）。上游历史版本保留在下方备查。
 
