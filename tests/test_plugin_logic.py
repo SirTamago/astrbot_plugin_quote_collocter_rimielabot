@@ -116,8 +116,8 @@ class DebugModeTest(PluginTestBase):
 
         path, note = self.plugin._draw_quote(GROUP, "指令 /语录", MEMBER)
         self.assertTrue(path)
-        self.assertIn("语录调试", note)
-        self.assertIn("保底：", note)
+        self.assertIn("出货计数", note)
+        self.assertIn("累计", note)
         self.assertIn(f"群{GROUP}", ENV.logger.text())
 
         ENV.logger.records.clear()
@@ -397,7 +397,7 @@ class AiToolTest(PluginTestBase):
         self.plugin._apply_group_settings(GROUP, debug_mode=2)
         ev = event(user=ADMIN)
         run(self.plugin.ai_quote_draw(ev))
-        self.assertIn("语录调试", ev.sent[0][1][0].text)
+        self.assertIn("出货计数", ev.sent[0][1][0].text)
 
     def test_submit_tool_permission(self):
         text = run(self.plugin.ai_quote_submit(self.member_ev, "标题"))
@@ -410,7 +410,7 @@ class AiToolTest(PluginTestBase):
 
 class WebApiTest(PluginTestBase):
     def test_routes_registered(self):
-        self.assertEqual(len(self.ctx.apis), 9)
+        self.assertEqual(len(self.ctx.apis), 11)
         self.assertIn(("/quote_collocter/group-debug", ["GET"]), self.ctx.apis)
         self.assertIn(("/quote_collocter/group-debug", ["POST"]), self.ctx.apis)
 
@@ -599,6 +599,62 @@ class ManageApiTest(PluginTestBase):
         self.assertIn("err", run(self.plugin.web_set_quote_rarity()))
         ENV.request.reset({}, {"group_id": GROUP, "names": []})
         self.assertIn("err", run(self.plugin.web_delete_quotes()))
+
+
+class ManageSortRenameTest(PluginTestBase):
+    """管理页：排序、改名、清零出货计数"""
+
+    def setUp(self):
+        super().setUp()
+        for name in ("3.b.jpg", "4.a.jpg", "6.c.jpg"):
+            ENV.put_image(GROUP, name)
+        self.plugin._log_submission(GROUP, "20002", "4.a.jpg", 100)
+        self.plugin._log_submission(GROUP, "10001", "3.b.jpg", 200)
+
+    def test_sort_by_rarity_and_display(self):
+        ENV.request.reset({"group_id": GROUP, "sort": "rarity", "order": "desc"})
+        data = run(self.plugin.web_quotes())["ok"]
+        self.assertEqual([i["rarity"] for i in data["items"]], [6, 4, 3])
+        self.assertEqual(data["sort"], "rarity")
+
+        ENV.request.reset({"group_id": GROUP, "sort": "display", "order": "asc"})
+        data = run(self.plugin.web_quotes())["ok"]
+        self.assertEqual([i["display"] for i in data["items"]], ["a.jpg", "b.jpg", "c.jpg"])
+
+        ENV.request.reset({"group_id": GROUP, "sort": "size", "order": "asc"})
+        self.assertEqual(run(self.plugin.web_quotes())["ok"]["sort"], "size")
+        # 未知排序键回退 name
+        ENV.request.reset({"group_id": GROUP, "sort": "bogus"})
+        self.assertEqual(run(self.plugin.web_quotes())["ok"]["sort"], "name")
+
+    def test_rename_quote(self):
+        ENV.request.reset({}, {"group_id": GROUP, "name": "4.a.jpg", "new_title": "新标题"})
+        res = run(self.plugin.web_rename_quote())["ok"]
+        self.assertTrue((ENV.group_dir(GROUP) / "4.新标题.jpg").exists())
+        self.assertFalse((ENV.group_dir(GROUP) / "4.a.jpg").exists())
+        self.assertTrue(res["message"])
+        self.assertEqual(res["rows"]["total"], 3)
+
+        # 重名被拒
+        ENV.request.reset({}, {"group_id": GROUP, "name": "3.b.jpg", "new_title": "新标题"})
+        self.assertIn("err", run(self.plugin.web_rename_quote()))
+
+        ENV.request.reset({}, {"group_id": GROUP, "name": "3.b.jpg", "new_title": ""})
+        self.assertIn("err", run(self.plugin.web_rename_quote()))
+
+    def test_reset_draw_stats(self):
+        state = ENV.group_dir(GROUP) / "order.json"
+        state.parent.mkdir(parents=True, exist_ok=True)
+        state.write_text(
+            json.dumps({"since": {"6": 3}, "recent": [], "stats": {"6": 5, "3": 7}}),
+            encoding="utf-8",
+        )
+        ENV.request.reset({}, {"group_id": GROUP})
+        res = run(self.plugin.web_reset_draw_stats())["ok"]
+        self.assertEqual(res["total_draws"], 0)
+        saved = ENV.read_json(state)
+        self.assertEqual(saved["stats"], {str(r): 0 for r in M.RARITY_ORDER})
+        self.assertEqual(saved["since"], {"6": 3})  # 保底计数不受影响
 
 
 if __name__ == "__main__":

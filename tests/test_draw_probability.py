@@ -189,7 +189,7 @@ class StateTest(unittest.TestCase):
         drawer = M.QuoteDrawer(d, window=4, weights=WEIGHTS, pity={6: 10})
         drawer.next()
         state = json.loads((d / "order.json").read_text(encoding="utf-8"))
-        self.assertEqual(set(state), {"since", "recent"})
+        self.assertEqual(set(state), {"since", "recent", "stats"})
         self.assertEqual(len(state["recent"]), 1)
         self.assertEqual(state["since"]["6"], 1)
 
@@ -246,20 +246,22 @@ class TraceTest(unittest.TestCase):
         self.assertEqual(trace["pity"]["triggered"], 6)
         self.assertEqual(trace["rarity_final"], 6)
         self.assertNotEqual(trace["rarity_by_weight"], 6)  # 权重本来抽不到 6★
-        self.assertIn("保底覆盖", M.format_draw_trace(trace, verbose=False))
+        self.assertIn("出货计数", M.format_draw_trace(trace))
 
-    def test_verbose_has_extra_lines(self):
+    def test_debug_line_is_one_line_of_counts(self):
+        """调试输出只保留出货计数一行，便于核对概率。"""
         random.seed(53)
-        d = make_library({1: 3})
-        drawer = M.QuoteDrawer(d, window=0, weights=WEIGHTS, pity={})
-        drawer.next()
-        verbose = M.format_draw_trace(drawer.last_trace, verbose=True)
-        compact = M.format_draw_trace(drawer.last_trace, verbose=False)
-        self.assertIn("权重：", verbose)
-        self.assertIn("出货后计数：", verbose)
-        self.assertNotIn("出货后计数：", compact)
-        self.assertEqual(len(compact.splitlines()), 4)
-        self.assertIn("保底：", compact)
+        d = make_library({6: 1, 3: 2})
+        drawer = M.QuoteDrawer(d, window=0, weights={6: 1.0, 3: 1.0}, pity={})
+        for _ in range(3):
+            drawer.next()
+        text = M.format_draw_trace(drawer.last_trace)
+        self.assertEqual(len(text.splitlines()), 1)
+        self.assertIn("出货计数（累计 3 抽）：", text)
+        self.assertIn("6★", text)
+        for label in ("权重", "本次出率", "保底", "抽取"):
+            self.assertNotIn(label, text)
+        self.assertEqual(M.format_draw_trace(None), "")
 
 
 class ArknightsDefaultTest(unittest.TestCase):
@@ -296,6 +298,36 @@ class ArknightsDefaultTest(unittest.TestCase):
         self.assertEqual(M.parse_quote_rarity("6.a.jpg")[0], 6)
         self.assertEqual(M.parse_quote_rarity("7.a.jpg")[0], 1)   # 越界按 1★
         self.assertEqual(M.parse_quote_rarity("a.jpg")[0], 1)
+
+
+class DrawStatsTest(unittest.TestCase):
+    """累计出货计数：与保底无关，用来核对概率。"""
+
+    def test_stats_persist_and_match_draws(self):
+        random.seed(20261019)
+        d = make_library({6: 1, 4: 2, 3: 3})
+        weights = {6: 2, 4: 50, 3: 40}
+        drawer = M.QuoteDrawer(d, window=0, weights=weights, pity={})
+        for _ in range(200):
+            drawer.next()
+        state = json.loads((d / "order.json").read_text(encoding="utf-8"))
+        stats = state["stats"]
+        self.assertEqual(sum(int(v) for v in stats.values()), 200)
+        self.assertEqual(drawer.last_trace["total_draws"], 200)
+        self.assertEqual(drawer.last_trace["stats"][6], int(stats["6"]))
+        self.assertIn("累计 200 抽", M.format_draw_trace(drawer.last_trace))
+
+    def test_stats_are_independent_of_pity(self):
+        """保底只改变抽到什么，计数按实际抽到的星级累加。"""
+        random.seed(20261020)
+        d = make_library({6: 1, 3: 20})
+        drawer = M.QuoteDrawer(d, window=0, weights={6: 0.0, 3: 100.0}, pity={6: 2})
+        for _ in range(10):
+            drawer.next()
+        state = json.loads((d / "order.json").read_text(encoding="utf-8"))
+        self.assertEqual(int(state["stats"]["6"]), 5)   # 每 2 抽保底一次 6★
+        self.assertEqual(int(state["stats"]["3"]), 5)
+        self.assertEqual(drawer.last_trace["pity"]["triggered"], 6)
 
 
 if __name__ == "__main__":

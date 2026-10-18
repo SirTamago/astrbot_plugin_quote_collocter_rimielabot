@@ -8,7 +8,7 @@
   <body>
     <header>
       <h1 data-i18n="title">群友语录 管理面板</h1>
-      <p class="subtitle" data-i18n="subtitle">全局设置、出率权重、保底与投稿日志</p>
+      <p class="subtitle" data-i18n="subtitle">语录管理、全局设置、出率权重、保底与投稿日志</p>
     </header>
 
     <main>
@@ -67,8 +67,8 @@
         <h2 data-i18n="groupDebugTitle">按群调试模式</h2>
         <p class="hint" data-i18n="groupDebugHint">
           调试模式按群保存，只影响填写的那个群；群内管理员也可直接用
-          <code>/语录调试 &lt;0|1|2&gt;</code>。0 关闭；1 每次抽卡把概率模型（出率、去重、保底判定）
-          写入 AstrBot 日志；2 额外在语录卡片上附注简版信息。
+          <code>/语录调试 &lt;0|1|2&gt;</code>。0 关闭；1 每次抽卡把「出货计数」
+          写入 AstrBot 日志；2 额外把同一行附注在语录卡片上。
         </p>
         <div class="settings-grid">
           <label>
@@ -89,6 +89,79 @@
           <button id="saveGroupDebug" data-i18n="groupDebugSave">保存到该群</button>
           <span id="debugMsg" class="msg"></span>
         </div>
+      </section>
+
+      <!-- 语录管理区 -->
+      <section class="card">
+        <h2 data-i18n="quotesTitle">语录管理</h2>
+        <div class="toolbar">
+          <label>
+            <span>群号</span>
+            <input id="q_group" type="text" placeholder="例如 123456789" />
+          </label>
+          <label>
+            <span>星级</span>
+            <select id="q_rarity"></select>
+          </label>
+          <label>
+            <span>关键词</span>
+            <input id="q_query" type="text" placeholder="标题或文件名" />
+          </label>
+          <label>
+            <span>每页</span>
+            <select id="q_page_size">
+              <option value="10">10</option>
+              <option value="20" selected>20</option>
+              <option value="50">50</option>
+              <option value="100">100</option>
+            </select>
+          </label>
+          <button id="q_load">查询</button>
+          <span id="q_msg" class="msg"></span>
+        </div>
+
+        <div class="bulk">
+          <label class="check"><input type="checkbox" id="q_select_all" /> 全选本页</label>
+          <span id="q_selected" class="muted">已选 0 张</span>
+          <span class="sep"></span>
+          <label>
+            <span>设为</span>
+            <select id="q_bulk_rarity"></select>
+          </label>
+          <button id="q_apply_selected">应用到选中</button>
+          <button id="q_apply_filtered">当前筛选全部设为该档</button>
+          <button id="q_delete_select" class="danger">删除选中</button>
+          <span class="sep"></span>
+          <button id="q_reset_stats" title="清零累计出货计数，不影响保底与图库">清零出货计数</button>
+        </div>
+
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th class="col-check"></th>
+                <th class="col-thumb">预览</th>
+                <th class="sortable" data-sort="display">标题 <span class="sort-mark"></span></th>
+                <th class="sortable col-rarity" data-sort="rarity">星级 <span class="sort-mark"></span></th>
+                <th class="sortable" data-sort="submitter">投稿人 <span class="sort-mark"></span></th>
+                <th class="sortable" data-sort="time">投稿时间 <span class="sort-mark"></span></th>
+                <th class="sortable col-size" data-sort="size">大小 <span class="sort-mark"></span></th>
+                <th class="col-actions"></th>
+              </tr>
+            </thead>
+            <tbody id="q_rows">
+              <tr><td colspan="8" class="empty">填写群号后点「查询」</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="pager">
+          <button id="q_prev">上一页</button>
+          <span id="q_page_info">-</span>
+          <button id="q_next">下一页</button>
+          <span id="q_total" class="muted"></span>
+        </div>
+        <p class="hint" id="q_rate_hint"></p>
       </section>
 
       <!-- 投稿日志区 -->
@@ -123,5 +196,6 @@
     </main>
 
     <script type="module" src="./app.js"></script>
+    <script type="module" src="./quotes.js"></script>
   </body>
 </html>

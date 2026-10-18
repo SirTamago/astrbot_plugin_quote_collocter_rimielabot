@@ -122,71 +122,19 @@ def quote_chain(path: str) -> list:
     return [Comp.Plain(text=text), Comp.Image.fromFileSystem(path)]
 
 
-def format_draw_trace(trace: dict | None, verbose: bool = True) -> str:
-    """把一次抽卡的调试数据渲染为可读文本（日志与群内附注共用）。
+def format_draw_trace(trace: dict | None) -> str:
+    """渲染「出货计数」一行（日志与群内附注共用）。
 
-    verbose=True 时额外输出权重明细与出货后的保底计数（用于日志）；
-    群内附注用 verbose=False，只保留出率、抽取过程与保底判定。
+    统计的是各星级**累计抽到次数**，与保底计数无关，用来核对实际出率
+    是否符合权重；保底只影响抽到什么，不会改变这里的累计值。
     """
     if not trace:
         return ""
 
-    order = RARITY_ORDER
-    counts = trace.get("counts") or {}
-    weights = trace.get("weights") or {}
-    shares = trace.get("share") or {}
-    pity = trace.get("pity") or {}
-    thresholds = pity.get("thresholds") or {}
-    since_used = pity.get("since_used") or {}
-    since_after = pity.get("since_after") or {}
-    triggered = pity.get("triggered")
-    skipped = list(pity.get("skipped") or [])
-
-    count_text = " ".join(f"{r}★×{counts.get(r, 0)}" for r in order)
-    rate_text = " ".join(f"{r}★{shares[r] * 100:.1f}%" for r in order if r in shares)
-    enabled = [r for r in order if int(thresholds.get(r, 0) or 0) > 0]
-    use_text = (
-        " ".join(
-            f"{r}★{since_used.get(r, 0)}/{thresholds.get(r, 0)}" for r in enabled
-        )
-        if enabled
-        else "未启用"
-    )
-
-    by_weight = trace.get("rarity_by_weight")
-    final_rarity = trace.get("rarity_final")
-    pick_text = f"权重抽中 {by_weight}★" if by_weight else "权重未抽出星级"
-    if triggered:
-        pick_text += f" → 保底覆盖为 {final_rarity}★"
-
-    lines = [
-        f"[语录调试] 群{trace.get('group', '?')}"
-        f"｜图库 {int(trace.get('total', 0))} 张：{count_text}",
-        f"本次出率：{rate_text}",
-        f"抽取：{pick_text}"
-        f"｜{final_rarity}★ 候选 {int(trace.get('candidates', 0))}"
-        f"/{int(trace.get('pool_size', 0))} 张"
-        f"（去重窗口 {int(trace.get('window', 0))}，"
-        f"排除 {int(trace.get('excluded', 0))} 张）→ {trace.get('final', '')}",
-        (
-            f"保底：触发 {triggered}★"
-            f"（判定 {since_used.get(triggered, 0)}/{thresholds.get(triggered, 0)}）"
-            if triggered
-            else f"保底：未触发（{use_text}）"
-        ),
-    ]
-    if skipped:
-        lines[-1] += "；" + "、".join(
-            f"{r}★ 已达阈值但本群无该档及以上图片（计数保留）" for r in skipped
-        )
-    if verbose:
-        lines.insert(
-            1, "权重：" + " ".join(f"{r}★{weights.get(r, 0):g}" for r in order)
-        )
-        lines.append(
-            "出货后计数：" + " ".join(f"{r}★{since_after.get(r, 0)}" for r in order)
-        )
-    return "\n".join(lines)
+    stats = trace.get("stats") or {}
+    total = int(trace.get("total_draws", 0))
+    counts = " ".join(f"{r}★{int(stats.get(r, 0))}" for r in RARITY_ORDER)
+    return f"出货计数（累计 {total} 抽）：{counts}"
 
 
 class QuoteDrawer:
@@ -320,6 +268,16 @@ class QuoteDrawer:
             for r in RARITY_ORDER
         }
 
+    def _stats_load(self, data: dict) -> dict:
+        """读取各星级的累计出货次数（核对概率用），缺失补 0。"""
+        raw = data.get("stats") or {}
+        if not isinstance(raw, dict):
+            raw = {}
+        return {
+            int(r): int(raw.get(str(r), raw.get(r, 0)) or 0)
+            for r in RARITY_ORDER
+        }
+
     def _recent_load(self, data: dict, image_set: set[str]) -> list[str]:
         """读取最近抽到的图片；过滤掉已删除/改名的文件，只留最后 window 张。"""
         if self.window <= 0:
@@ -412,11 +370,16 @@ class QuoteDrawer:
         for cr in range(1, out_r + 1):
             since[cr] = 0
 
+        # 累计出货统计（与保底无关，只用于核对概率）
+        stats = self._stats_load(data)
+        stats[out_r] = stats.get(out_r, 0) + 1
+
         recent = (recent + [target])[-self.window :] if self.window > 0 else []
         self._save(
             {
                 "since": {str(k): v for k, v in since.items()},
                 "recent": recent,
+                "stats": {str(k): v for k, v in stats.items()},
             }
         )
         self.last_trace = {
@@ -441,6 +404,8 @@ class QuoteDrawer:
                 "triggered": triggered_r or None,
                 "skipped": skipped,
             },
+            "stats": dict(stats),
+            "total_draws": sum(stats.values()),
             "final": target,
         }
         if triggered_r:
@@ -510,10 +475,22 @@ class QuotePlugin(Star):
             "Set quote rarity (single or bulk)",
         )
         context.register_web_api(
+            f"/{PLUGIN_NAME}/quotes/rename",
+            self.web_rename_quote,
+            ["POST"],
+            "Rename a quote",
+        )
+        context.register_web_api(
             f"/{PLUGIN_NAME}/quotes/delete",
             self.web_delete_quotes,
             ["POST"],
             "Delete quotes",
+        )
+        context.register_web_api(
+            f"/{PLUGIN_NAME}/quotes/stats/reset",
+            self.web_reset_draw_stats,
+            ["POST"],
+            "Reset cumulative draw stats",
         )
         # 旧版本（1..5 档）→ 6 星刻度的数据迁移；有标记文件时直接跳过
         try:
@@ -1294,15 +1271,12 @@ class QuotePlugin(Star):
         level = self._debug_level(group_id)
         if level <= 0 or not drawer.last_trace:
             return path, ""
+        text = format_draw_trace(drawer.last_trace)
         logger.info(
-            f"[语录调试] 来源={source or '未知'} 用户={user_id or '未知'}\n"
-            f"{format_draw_trace(drawer.last_trace, verbose=True)}"
+            f"[语录调试] 群{group_id}｜来源={source or '未知'} "
+            f"用户={user_id or '未知'}\n{text}"
         )
-        note = (
-            format_draw_trace(drawer.last_trace, verbose=False)
-            if level >= 2 and path
-            else ""
-        )
+        note = text if level >= 2 and path else ""
         return path, note
 
     @staticmethod
@@ -2244,6 +2218,21 @@ class QuotePlugin(Star):
             ]
         return files
 
+    @staticmethod
+    def _quote_sort_key(group_id: str, path: Path, sort: str, finder) -> tuple:
+        """管理页排序键；submitter/time 需要查投稿记录。"""
+        if sort == "rarity":
+            return (parse_quote_rarity(path.name)[0], path.name.lower())
+        if sort == "size":
+            return (path.stat().st_size, path.name.lower())
+        if sort in ("submitter", "time"):
+            record = finder(group_id, path.name) or {}
+            key = "user_id" if sort == "submitter" else "time"
+            return (str(record.get(key, "")), path.name.lower())
+        if sort == "display":
+            return (parse_quote_rarity(path.name)[1].lower(), path.name.lower())
+        return (path.name.lower(),)
+
     def _quote_rows(
         self,
         group_id: str,
@@ -2251,9 +2240,19 @@ class QuotePlugin(Star):
         query: str = "",
         page: int = 1,
         page_size: int = 20,
+        sort: str = "name",
+        order: str = "asc",
     ) -> dict:
-        """管理页表格数据：分页 + 星级/关键词筛选 + 缩略图 URL + 投稿信息。"""
+        """管理页表格数据：筛选/排序/分页 + 缩略图 URL + 投稿信息。"""
         files = self._match_quotes(group_id, rarity, query)
+        if sort not in {"name", "display", "rarity", "submitter", "time", "size"}:
+            sort = "name"
+        files.sort(
+            key=lambda path: self._quote_sort_key(
+                group_id, path, sort, self._find_submission_record
+            ),
+            reverse=(order == "desc"),
+        )
         total = len(files)
         page_size = max(1, min(100, page_size))
         pages = max(1, (total + page_size - 1) // page_size)
@@ -2284,6 +2283,8 @@ class QuotePlugin(Star):
             "page": page,
             "pages": pages,
             "page_size": page_size,
+            "sort": sort,
+            "order": order,
             "items": items,
         }
 
@@ -2298,8 +2299,10 @@ class QuotePlugin(Star):
         query = str(request.query.get("query") or "")
         page = self._as_int(request.query.get("page", 1, type=int), 1) or 1
         page_size = self._as_int(request.query.get("page_size", 20, type=int), 20) or 20
+        sort = str(request.query.get("sort") or "name")
+        order = str(request.query.get("order") or "asc")
         return json_response(
-            self._quote_rows(group_id, rarity, query, page, page_size)
+            self._quote_rows(group_id, rarity, query, page, page_size, sort, order)
         )
 
     async def web_quote_image(self):
@@ -2368,7 +2371,74 @@ class QuotePlugin(Star):
                     filter_query,
                     self._as_int(payload.get("page"), 1) or 1,
                     self._as_int(payload.get("page_size"), 20) or 20,
+                    str(payload.get("sort") or "name"),
+                    str(payload.get("order") or "asc"),
                 ),
+            }
+        )
+
+    async def web_rename_quote(self):
+        """重命名一条语录（只改标题，保留星级与扩展名）。"""
+        payload = await request.json(default={})
+        if not isinstance(payload, dict):
+            return error_response("请求体必须是 JSON 对象")
+        group_id = str(payload.get("group_id") or "").strip()
+        if not group_id.isdigit():
+            return error_response("请填写数字群号")
+        name = str(payload.get("name") or "").strip()
+        new_title = str(payload.get("new_title") or "").strip()
+        if not name or not new_title:
+            return error_response("name / new_title 不能为空")
+        target = self._find_quote_file(group_id, name)
+        if not target:
+            return error_response("未找到该语录", status_code=404)
+        ok, text = self._rename_quote_file(group_id, target, new_title)
+        if not ok:
+            return error_response(text)
+        return json_response(
+            {
+                "message": text,
+                "rows": self._quote_rows(
+                    group_id,
+                    self._as_int(payload.get("filter_rarity"), 0),
+                    str(payload.get("filter_query") or ""),
+                    self._as_int(payload.get("page"), 1) or 1,
+                    self._as_int(payload.get("page_size"), 20) or 20,
+                    str(payload.get("sort") or "name"),
+                    str(payload.get("order") or "asc"),
+                ),
+            }
+        )
+
+    async def web_reset_draw_stats(self):
+        """清零本群累计出货计数（不影响保底计数、去重与图库）。"""
+        payload = await request.json(default={})
+        if not isinstance(payload, dict):
+            return error_response("请求体必须是 JSON 对象")
+        group_id = str(payload.get("group_id") or "").strip()
+        if not group_id.isdigit():
+            return error_response("请填写数字群号")
+        state_path = self._group_dir(group_id) / "order.json"
+        data: dict = {}
+        if state_path.exists():
+            try:
+                data = json.loads(state_path.read_text(encoding="utf-8")) or {}
+            except Exception:
+                data = {}
+        data["stats"] = {str(r): 0 for r in RARITY_ORDER}
+        try:
+            self._group_dir(group_id).mkdir(parents=True, exist_ok=True)
+            state_path.write_text(
+                json.dumps(data, ensure_ascii=False), encoding="utf-8"
+            )
+        except Exception as e:
+            logger.error(f"清零出货统计失败: {e}")
+            return error_response(f"清零失败：{e}")
+        return json_response(
+            {
+                "group_id": group_id,
+                "stats": {r: 0 for r in RARITY_ORDER},
+                "total_draws": 0,
             }
         )
 
