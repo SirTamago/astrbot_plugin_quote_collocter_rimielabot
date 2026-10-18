@@ -146,7 +146,7 @@ def format_draw_trace(trace: dict | None) -> str:
     weights = trace.get("weights") or {}
     total = int(trace.get("total_draws", 0))
 
-    counts_line = " ".join(f"{r}★{int(stats.get(r, 0))}" for r in RARITY_ORDER)
+    counts_line = " / ".join(f"{r}★{int(stats.get(r, 0))}" for r in RARITY_ORDER)
     total_weight = sum(max(0.0, float(weights.get(r, 0) or 0)) for r in RARITY_ORDER)
 
     rate_parts: list[str] = []
@@ -157,11 +157,11 @@ def format_draw_trace(trace: dict | None) -> str:
             continue
         actual = (count / total * 100) if total else 0.0
         configured = (weight / total_weight * 100) if total_weight > 0 else 0.0
-        rate_parts.append(f"{r}★ {actual:.1f}({configured:g})%")
+        rate_parts.append(f"{r}★{actual:.1f}({configured:g})%")
 
     lines = ["[语录调试]", f"出货计数：{counts_line}"]
     if rate_parts:
-        lines.append(" ".join(rate_parts))
+        lines.append("概率统计：" + " / ".join(rate_parts))
     return "\n".join(lines)
 
 

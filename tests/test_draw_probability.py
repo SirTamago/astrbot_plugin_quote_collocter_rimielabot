@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import random
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -259,7 +260,10 @@ class TraceTest(unittest.TestCase):
         lines = M.format_draw_trace(drawer.last_trace).splitlines()
         self.assertEqual(lines[0], "[语录调试]")
         self.assertTrue(lines[1].startswith("出货计数：6★"))
+        self.assertTrue(lines[2].startswith("概率统计："))
         self.assertIn("6★", lines[2])
+        self.assertIn(" / ", lines[1])
+        self.assertIn(" / ", lines[2])
         self.assertIn("(2)%", lines[2])     # 6★ 设定概率
         self.assertIn("(40)%", lines[2])    # 3★ 设定概率
         self.assertNotIn("权重：", "\n".join(lines))
@@ -273,8 +277,8 @@ class TraceTest(unittest.TestCase):
         for _ in range(5):
             drawer.next()
         lines = M.format_draw_trace(drawer.last_trace).splitlines()
-        self.assertIn("1★ 100.0(100)%", lines[2])
-        self.assertIn("出货计数：6★0 5★0 4★0 3★0 2★0 1★5", lines[1])
+        self.assertIn("1★100.0(100)%", lines[2])
+        self.assertIn("出货计数：6★0 / 5★0 / 4★0 / 3★0 / 2★0 / 1★5", lines[1])
 
 
 class ArknightsDefaultTest(unittest.TestCase):
@@ -330,10 +334,9 @@ class DrawStatsTest(unittest.TestCase):
         self.assertEqual(drawer.last_trace["stats"][6], int(stats["6"]))
         line = M.format_draw_trace(drawer.last_trace).splitlines()[1]
         self.assertTrue(line.startswith("出货计数："))
-        self.assertEqual(
-            sum(int(part.split("★", 1)[1]) for part in line[len("出货计数："):].split()),
-            200,
-        )
+        pairs = re.findall(r"\d★(\d+)", line)
+        self.assertEqual(len(pairs), 6)
+        self.assertEqual(sum(int(value) for value in pairs), 200)
 
     def test_stats_are_independent_of_pity(self):
         """保底只改变抽到什么，计数按实际抽到的星级累加。"""
