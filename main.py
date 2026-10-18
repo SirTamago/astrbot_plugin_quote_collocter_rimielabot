@@ -1,3 +1,5 @@
+import base64
+import io
 import json
 import mimetypes
 import os
@@ -6,6 +8,11 @@ import re
 import time
 from pathlib import Path
 from urllib.parse import quote as urlquote
+
+try:  # AstrBot 自带 Pillow；缺失时管理页退化为不显示缩略图
+    from PIL import Image as _PILImage
+except Exception:  # pragma: no cover - 仅在无 Pillow 的环境触发
+    _PILImage = None
 
 import aiohttp
 import astrbot.api.message_components as Comp
@@ -88,6 +95,9 @@ DEFAULT_SUBMIT_RARITY = 3
 RARITY_SCALE_MARKER = QUOTES_ROOT / ".rarity_scale"
 RARITY_SCALE_VERSION = "6-star"
 
+# 管理页缩略图尺寸（像素）：页面里以 data URL 内嵌，避免 iframe 直接请求接口
+THUMB_SIZE = (160, 120)
+
 
 def parse_quote_rarity(filename: str) -> tuple[int, str]:
     """解析 '<1-6>.<string>.<ext>' 格式的文件名（首位数字 = 星级）。
@@ -123,18 +133,36 @@ def quote_chain(path: str) -> list:
 
 
 def format_draw_trace(trace: dict | None) -> str:
-    """渲染「出货计数」一行（日志与群内附注共用）。
+    """渲染调试信息：标题 + 出货计数 + 各星级「实际(设定)概率」。
 
-    统计的是各星级**累计抽到次数**，与保底计数无关，用来核对实际出率
-    是否符合权重；保底只影响抽到什么，不会改变这里的累计值。
+    出货计数是各星级**累计抽到次数**，与保底计数无关（保底只影响抽到什么，
+    计数按实际抽到的星级累加），因此可以直接核对实际出率是否符合权重。
+    概率行只列出「设定权重非 0」或「已有出货」的星级，避免 0 权重档刷屏。
     """
     if not trace:
         return ""
 
     stats = trace.get("stats") or {}
+    weights = trace.get("weights") or {}
     total = int(trace.get("total_draws", 0))
-    counts = " ".join(f"{r}★{int(stats.get(r, 0))}" for r in RARITY_ORDER)
-    return f"出货计数（累计 {total} 抽）：{counts}"
+
+    counts_line = " ".join(f"{r}★{int(stats.get(r, 0))}" for r in RARITY_ORDER)
+    total_weight = sum(max(0.0, float(weights.get(r, 0) or 0)) for r in RARITY_ORDER)
+
+    rate_parts: list[str] = []
+    for r in RARITY_ORDER:
+        weight = max(0.0, float(weights.get(r, 0) or 0))
+        count = int(stats.get(r, 0))
+        if weight <= 0 and count <= 0:
+            continue
+        actual = (count / total * 100) if total else 0.0
+        configured = (weight / total_weight * 100) if total_weight > 0 else 0.0
+        rate_parts.append(f"{r}★ {actual:.1f}({configured:g})%")
+
+    lines = ["[语录调试]", f"出货计数：{counts_line}"]
+    if rate_parts:
+        lines.append(" ".join(rate_parts))
+    return "\n".join(lines)
 
 
 class QuoteDrawer:
@@ -424,6 +452,8 @@ class QuotePlugin(Star):
         self.config = config
         # 群 -> QuoteDrawer（缓存权重/保底/窗口配置快照）
         self._drawers: dict[str, QuoteDrawer] = {}
+        # 管理页缩略图缓存：key 含路径与 mtime，值是可内嵌的 data URL
+        self._thumb_cache: dict[str, str] = {}
         # 注册 WebUI Page 后端 API
         context.register_web_api(
             f"/{PLUGIN_NAME}/settings",
@@ -466,7 +496,13 @@ class QuotePlugin(Star):
             f"/{PLUGIN_NAME}/quotes/image",
             self.web_quote_image,
             ["GET"],
-            "Get quote image thumbnail",
+            "Get quote image (direct URL)",
+        )
+        context.register_web_api(
+            f"/{PLUGIN_NAME}/quotes/full",
+            self.web_quote_full,
+            ["GET"],
+            "Get quote image as data URL",
         )
         context.register_web_api(
             f"/{PLUGIN_NAME}/quotes/rarity",
@@ -1272,9 +1308,10 @@ class QuotePlugin(Star):
         if level <= 0 or not drawer.last_trace:
             return path, ""
         text = format_draw_trace(drawer.last_trace)
+        body = text.split("\n", 1)[1] if "\n" in text else text
         logger.info(
             f"[语录调试] 群{group_id}｜来源={source or '未知'} "
-            f"用户={user_id or '未知'}\n{text}"
+            f"用户={user_id or '未知'}\n{body}"
         )
         note = text if level >= 2 and path else ""
         return path, note
@@ -2218,6 +2255,55 @@ class QuotePlugin(Star):
             ]
         return files
 
+    def _image_data_url(
+        self, path: Path, max_size: tuple[int, int] | None = None
+    ) -> str | None:
+        """把图片转成 data URL；max_size 非空时用 Pillow 生成缩略图。
+
+        插件页 iframe 与 dashboard 隔离（拿不到它的 cookie），不能直接用
+        ``<img src="/api/...">`` 请求接口，所以缩略图内嵌成 data URL。
+        Pillow 缺失、图片损坏或格式不支持时返回 None（前端显示占位）。
+        """
+        if not path.exists():
+            return None
+        cache_key = None
+        if max_size:
+            try:
+                cache_key = (
+                    f"{max_size[0]}x{max_size[1]}|{path}|{path.stat().st_mtime_ns}"
+                )
+            except OSError:
+                cache_key = None
+            if cache_key and cache_key in self._thumb_cache:
+                return self._thumb_cache[cache_key]
+
+        try:
+            data = path.read_bytes()
+        except OSError:
+            return None
+        mime = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+
+        if max_size:
+            if _PILImage is None:
+                return None  # 没有 Pillow 就不内嵌原图（可能好几 MB × 每页 20 张）
+            try:
+                with _PILImage.open(io.BytesIO(data)) as image:
+                    image = image.convert("RGB")
+                    image.thumbnail(max_size)
+                    buffer = io.BytesIO()
+                    image.save(buffer, format="JPEG", quality=72)
+                data = buffer.getvalue()
+                mime = "image/jpeg"
+            except Exception:
+                return None
+
+        data_url = f"data:{mime};base64,{base64.b64encode(data).decode()}"
+        if cache_key:
+            if len(self._thumb_cache) > 500:
+                self._thumb_cache.clear()
+            self._thumb_cache[cache_key] = data_url
+        return data_url
+
     @staticmethod
     def _quote_sort_key(group_id: str, path: Path, sort: str, finder) -> tuple:
         """管理页排序键；submitter/time 需要查投稿记录。"""
@@ -2268,6 +2354,7 @@ class QuotePlugin(Star):
                     "rarity": rarity_value,
                     "stars": RARITY_TEXT[rarity_value],
                     "size": path.stat().st_size,
+                    "thumb": self._image_data_url(path, THUMB_SIZE),
                     "submitter": record.get("user_id", ""),
                     "time": record.get("time", ""),
                     "image_url": (
@@ -2320,6 +2407,20 @@ class QuotePlugin(Star):
             return error_response("非法路径", status_code=400)
         mime = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
         return file_response(target, content_type=mime)
+
+    async def web_quote_full(self):
+        """返回一张语录的完整图片（data URL），供管理页点开预览。"""
+        group_id = str(request.query.get("group_id") or "").strip()
+        name = str(request.query.get("name") or "").strip()
+        if not group_id.isdigit() or not name:
+            return error_response("参数不完整")
+        target = self._find_quote_file(group_id, name)
+        if not target:
+            return error_response("未找到该语录", status_code=404)
+        data_url = self._image_data_url(target)
+        if not data_url:
+            return error_response("读取图片失败", status_code=500)
+        return json_response({"name": target.name, "data_url": data_url})
 
     async def web_set_quote_rarity(self):
         """把一批语录（或「当前筛选的全部」）改成指定星级。

@@ -248,20 +248,33 @@ class TraceTest(unittest.TestCase):
         self.assertNotEqual(trace["rarity_by_weight"], 6)  # 权重本来抽不到 6★
         self.assertIn("出货计数", M.format_draw_trace(trace))
 
-    def test_debug_line_is_one_line_of_counts(self):
-        """调试输出只保留出货计数一行，便于核对概率。"""
+    def test_debug_lines_include_rates(self):
+        """调试输出：标题 + 出货计数 + 各星级「实际(设定)概率」。"""
         random.seed(53)
         d = make_library({6: 1, 3: 2})
-        drawer = M.QuoteDrawer(d, window=0, weights={6: 1.0, 3: 1.0}, pity={})
-        for _ in range(3):
+        weights = {6: 2, 5: 8, 4: 50, 3: 40, 2: 0, 1: 0}
+        drawer = M.QuoteDrawer(d, window=0, weights=weights, pity={})
+        for _ in range(4):
             drawer.next()
-        text = M.format_draw_trace(drawer.last_trace)
-        self.assertEqual(len(text.splitlines()), 1)
-        self.assertIn("出货计数（累计 3 抽）：", text)
-        self.assertIn("6★", text)
-        for label in ("权重", "本次出率", "保底", "抽取"):
-            self.assertNotIn(label, text)
+        lines = M.format_draw_trace(drawer.last_trace).splitlines()
+        self.assertEqual(lines[0], "[语录调试]")
+        self.assertTrue(lines[1].startswith("出货计数：6★"))
+        self.assertIn("6★", lines[2])
+        self.assertIn("(2)%", lines[2])     # 6★ 设定概率
+        self.assertIn("(40)%", lines[2])    # 3★ 设定概率
+        self.assertNotIn("权重：", "\n".join(lines))
         self.assertEqual(M.format_draw_trace(None), "")
+
+    def test_debug_rates_use_actual_counts(self):
+        """实际概率 = 累计出货 / 总抽数；设定概率 = 权重占比。"""
+        random.seed(54)
+        d = make_library({1: 3})  # 只有 1★，权重只给 1★
+        drawer = M.QuoteDrawer(d, window=0, weights={6: 0, 5: 0, 4: 0, 3: 0, 2: 0, 1: 100}, pity={})
+        for _ in range(5):
+            drawer.next()
+        lines = M.format_draw_trace(drawer.last_trace).splitlines()
+        self.assertIn("1★ 100.0(100)%", lines[2])
+        self.assertIn("出货计数：6★0 5★0 4★0 3★0 2★0 1★5", lines[1])
 
 
 class ArknightsDefaultTest(unittest.TestCase):
@@ -315,7 +328,12 @@ class DrawStatsTest(unittest.TestCase):
         self.assertEqual(sum(int(v) for v in stats.values()), 200)
         self.assertEqual(drawer.last_trace["total_draws"], 200)
         self.assertEqual(drawer.last_trace["stats"][6], int(stats["6"]))
-        self.assertIn("累计 200 抽", M.format_draw_trace(drawer.last_trace))
+        line = M.format_draw_trace(drawer.last_trace).splitlines()[1]
+        self.assertTrue(line.startswith("出货计数："))
+        self.assertEqual(
+            sum(int(part.split("★", 1)[1]) for part in line[len("出货计数："):].split()),
+            200,
+        )
 
     def test_stats_are_independent_of_pity(self):
         """保底只改变抽到什么，计数按实际抽到的星级累加。"""

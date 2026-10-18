@@ -117,7 +117,8 @@ class DebugModeTest(PluginTestBase):
         path, note = self.plugin._draw_quote(GROUP, "指令 /语录", MEMBER)
         self.assertTrue(path)
         self.assertIn("出货计数", note)
-        self.assertIn("累计", note)
+        self.assertIn("[语录调试]", note)
+        self.assertIn("(", note)
         self.assertIn(f"群{GROUP}", ENV.logger.text())
 
         ENV.logger.records.clear()
@@ -410,7 +411,7 @@ class AiToolTest(PluginTestBase):
 
 class WebApiTest(PluginTestBase):
     def test_routes_registered(self):
-        self.assertEqual(len(self.ctx.apis), 11)
+        self.assertEqual(len(self.ctx.apis), 12)
         self.assertIn(("/quote_collocter/group-debug", ["GET"]), self.ctx.apis)
         self.assertIn(("/quote_collocter/group-debug", ["POST"]), self.ctx.apis)
 
@@ -655,6 +656,29 @@ class ManageSortRenameTest(PluginTestBase):
         saved = ENV.read_json(state)
         self.assertEqual(saved["stats"], {str(r): 0 for r in M.RARITY_ORDER})
         self.assertEqual(saved["since"], {"6": 3})  # 保底计数不受影响
+
+
+class QuoteImageApiTest(PluginTestBase):
+    """管理页图片：缩略图 data URL（Pillow）与完整图接口。"""
+
+    def setUp(self):
+        super().setUp()
+        ENV.put_image(GROUP, "3.solid.jpg", content=b"not-a-real-image")
+
+    def test_thumb_field_and_full_image(self):
+        ENV.request.reset({"group_id": GROUP})
+        item = run(self.plugin.web_quotes())["ok"]["items"][0]
+        self.assertIn("thumb", item)
+        # 伪造的图片字节：有 Pillow 时缩略图为 None，无 Pillow 时同样为 None
+        self.assertIn(item["thumb"], (None,))
+
+        ENV.request.reset({"group_id": GROUP, "name": "3.solid.jpg"})
+        res = run(self.plugin.web_quote_full())["ok"]
+        self.assertTrue(res["data_url"].startswith("data:image/jpeg;base64,"))
+        self.assertEqual(res["name"], "3.solid.jpg")
+
+        ENV.request.reset({"group_id": GROUP, "name": "不存在.jpg"})
+        self.assertIn("err", run(self.plugin.web_quote_full()))
 
 
 if __name__ == "__main__":

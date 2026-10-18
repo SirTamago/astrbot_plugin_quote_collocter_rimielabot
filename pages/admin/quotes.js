@@ -1,7 +1,6 @@
 // 语录管理（内嵌在 admin 页面里）
 // 用 bridge 调后端 API；缩略图走插件扩展路由（同一 dashboard 源，带 cookie）。
 const bridge = window.AstrBotPluginView || window.AstrBotPluginPage;
-const API_PREFIX = "/api/v1/plugins/extensions";
 
 const RARITIES = [6, 5, 4, 3, 2, 1];
 const stars = (n) => "★".repeat(n);
@@ -114,19 +113,20 @@ function renderRows() {
 
     const tdThumb = document.createElement("td");
     tdThumb.className = "col-thumb";
-    const img = document.createElement("img");
-    img.loading = "lazy";
-    // 后端返回的是 "/quote_collocter/quotes/image?...", 只加扩展路由前缀
-    img.src = `${API_PREFIX}${item.image_url}`;
-    img.alt = item.display;
-    img.title = "点击查看大图";
-    img.addEventListener("click", () => window.open(img.src, "_blank"));
-    img.addEventListener("error", () => {
-      tdThumb.textContent = "×";
+    if (item.thumb) {
+      // iframe 拿不到 dashboard cookie，缩略图由后端内嵌成 data URL
+      const img = document.createElement("img");
+      img.loading = "lazy";
+      img.src = item.thumb;
+      img.alt = item.display;
+      img.title = "点击查看大图";
+      img.addEventListener("click", () => openPreview(item));
+      tdThumb.appendChild(img);
+    } else {
+      tdThumb.textContent = "无预览";
       tdThumb.classList.add("thumb-error");
-      tdThumb.title = "图片加载失败";
-    });
-    tdThumb.appendChild(img);
+      tdThumb.title = "无法生成缩略图（缺少 Pillow 或图片损坏）";
+    }
 
     const tdTitle = document.createElement("td");
     tdTitle.className = "col-title";
@@ -274,6 +274,29 @@ async function applyFiltered(rarity) {
   }
 }
 
+async function openPreview(item) {
+  const modal = $("q_modal");
+  const img = $("q_modal_img");
+  $("q_modal_name").textContent = item.display;
+  modal.hidden = false;
+  img.removeAttribute("src");
+  try {
+    const res = await bridge.apiGet("quotes/full", {
+      group_id: q.groupId,
+      name: item.name,
+    });
+    img.src = res.data_url;
+  } catch (e) {
+    qMsg(`读取图片失败：${e.message}`, false);
+    modal.hidden = true;
+  }
+}
+
+function closePreview() {
+  $("q_modal").hidden = true;
+  $("q_modal_img").removeAttribute("src");
+}
+
 async function renameQuote(item) {
   const dot = item.display.lastIndexOf(".");
   const current = dot > 0 ? item.display.slice(0, dot) : item.display;
@@ -378,6 +401,13 @@ async function main() {
     deleteQuotes(names);
   });
   $("q_reset_stats").addEventListener("click", resetStats);
+  $("q_modal_close").addEventListener("click", closePreview);
+  $("q_modal").addEventListener("click", (e) => {
+    if (e.target === $("q_modal")) closePreview();
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && !$("q_modal").hidden) closePreview();
+  });
 
   $("q_prev").addEventListener("click", () => {
     if (q.page > 1) loadQuotes(q.page - 1);

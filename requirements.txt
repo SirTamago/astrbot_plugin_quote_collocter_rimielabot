@@ -1,1 +1,3 @@
 aiohttp
+# 管理页缩略图需要 Pillow（AstrBot 自带；缺失时管理页只显示占位，不影响其他功能）
+pillow>=11.2.1
