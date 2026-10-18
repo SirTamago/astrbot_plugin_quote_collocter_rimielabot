@@ -170,13 +170,13 @@ class CommandTest(PluginTestBase):
                       first_text(drive(self.plugin.set_submit_mode(event(user=ADMIN), 9))))
 
     def test_random_quote_returns_chain(self):
-        ENV.put_image(GROUP, "5.only.jpg")
+        ENV.put_image(GROUP, "6.only.jpg")
         results = drive(self.plugin.random_quote(event()))
         self.assertEqual(results[0][0], "chain")
         chain = results[0][1]
         self.assertIsInstance(chain[0], M.Comp.Plain)
         self.assertIsInstance(chain[-1], M.Comp.Image)
-        self.assertIn("SSSR", chain[0].text)
+        self.assertIn("★★★★★★", chain[0].text)
 
     def test_random_quote_empty_library(self):
         results = drive(self.plugin.random_quote(event()))
@@ -268,8 +268,8 @@ class SubmissionTest(PluginTestBase):
         self.plugin._apply_group_settings(GROUP, mode=2)
         ok, text = self._submit("标题")
         self.assertTrue(ok, text)
-        self.assertTrue((ENV.group_dir(GROUP) / "1.标题.png").exists())
-        record = self.plugin._find_submission_record(GROUP, "1.标题.png")
+        self.assertTrue((ENV.group_dir(GROUP) / "3.标题.png").exists())
+        record = self.plugin._find_submission_record(GROUP, "3.标题.png")
         self.assertEqual(record["user_id"], MEMBER)
 
     def test_duplicate_title_rejected(self):
@@ -282,14 +282,14 @@ class SubmissionTest(PluginTestBase):
     def test_rename_rarity_delete_keep_log_in_sync(self):
         self.plugin._apply_group_settings(GROUP, mode=2)
         self.assertTrue(self._submit("旧标题")[0])
-        target = ENV.group_dir(GROUP) / "1.旧标题.png"
+        target = ENV.group_dir(GROUP) / "3.旧标题.png"
 
         ok, _ = self.plugin._rename_quote_file(GROUP, target, "新标题")
         self.assertTrue(ok)
-        renamed = ENV.group_dir(GROUP) / "1.新标题.png"
+        renamed = ENV.group_dir(GROUP) / "3.新标题.png"
         self.assertTrue(renamed.exists())
-        self.assertIsNone(self.plugin._find_submission_record(GROUP, "1.旧标题.png"))
-        self.assertIsNotNone(self.plugin._find_submission_record(GROUP, "1.新标题.png"))
+        self.assertIsNone(self.plugin._find_submission_record(GROUP, "3.旧标题.png"))
+        self.assertIsNotNone(self.plugin._find_submission_record(GROUP, "3.新标题.png"))
 
         ok, _ = self.plugin._set_quote_rarity_file(GROUP, renamed, 5)
         self.assertTrue(ok)
@@ -306,7 +306,7 @@ class SubmissionTest(PluginTestBase):
     def test_revoke_only_owner(self):
         self.plugin._apply_group_settings(GROUP, mode=2)
         self.assertTrue(self._submit("我的投稿")[0])
-        target = ENV.group_dir(GROUP) / "1.我的投稿.png"
+        target = ENV.group_dir(GROUP) / "3.我的投稿.png"
 
         ok, text = self.plugin._revoke_quote_file(GROUP, ADMIN, target)
         self.assertFalse(ok)
@@ -345,21 +345,21 @@ class AiToolTest(PluginTestBase):
         super().setUp()
         self.plugin._apply_group_settings(GROUP, mode=2, debug_mode=1)
         ENV.put_image(GROUP, "3.甲.jpg")
-        ENV.put_image(GROUP, "5.乙.jpg")
+        ENV.put_image(GROUP, "6.乙.jpg")
         self.admin_ev = event(user=ADMIN)
         self.member_ev = event(user=MEMBER)
 
     def test_list_and_view(self):
         text = run(self.plugin.ai_quote_list(self.admin_ev, 0, 1, 10))
         self.assertIn("语录列表：共 2 张", text)
-        self.assertIn("[3星] 甲.jpg", text)
+        self.assertIn("[★★★] 甲.jpg", text)
         self.assertNotIn(str(ENV.data_root), text)  # 不泄露本地路径
 
-        text = run(self.plugin.ai_quote_list(self.admin_ev, 5, 1, 10))
-        self.assertIn("筛选 5 星", text)
+        text = run(self.plugin.ai_quote_list(self.admin_ev, 6, 1, 10))
+        self.assertIn("筛选 6 星", text)
 
         text = run(self.plugin.ai_quote_view(self.admin_ev, "乙"))
-        self.assertIn("恭喜抽到SSSR卡", text)
+        self.assertIn("★★★★★★", text)
 
     def test_status(self):
         text = run(self.plugin.ai_quote_status(self.member_ev))
@@ -410,7 +410,7 @@ class AiToolTest(PluginTestBase):
 
 class WebApiTest(PluginTestBase):
     def test_routes_registered(self):
-        self.assertEqual(len(self.ctx.apis), 5)
+        self.assertEqual(len(self.ctx.apis), 9)
         self.assertIn(("/quote_collocter/group-debug", ["GET"]), self.ctx.apis)
         self.assertIn(("/quote_collocter/group-debug", ["POST"]), self.ctx.apis)
 
@@ -461,6 +461,144 @@ class WebApiTest(PluginTestBase):
         ENV.request.reset({"limit": 1})
         data = run(self.plugin.web_submit_log())["ok"]
         self.assertEqual(data["total"], 1)
+
+
+class MigrationTest(PluginTestBase):
+    """1..5 档旧数据 → 1..6 星（1.1 起）"""
+
+    def _seed_legacy(self):
+        root = ENV.data_root
+        marker = root / ".rarity_scale"
+        if marker.exists():
+            marker.unlink()
+        group = ENV.group_dir("100")
+        group.mkdir(parents=True, exist_ok=True)
+        for name in ("1.a.jpg", "3.c.jpg", "5.b.jpg"):
+            (group / name).write_bytes(b"x")
+        records = [
+            {"ts": 1, "time": "t1", "group_id": "100", "user_id": "u1", "filename": "1.a.jpg"},
+            {"ts": 2, "time": "t2", "group_id": "100", "user_id": "u2", "filename": "5.b.jpg"},
+        ]
+        (root / "submit.log").write_text(
+            "\n".join(json.dumps(r, ensure_ascii=False) for r in records) + "\n",
+            encoding="utf-8",
+        )
+        (group / "order.json").write_text(
+            json.dumps({"since": {"1": 5, "5": 2}, "recent": ["1.a.jpg"]}),
+            encoding="utf-8",
+        )
+        (root / "settings.json").write_text(
+            json.dumps(
+                {
+                    "rarity_weights": {"weight_1": 2, "weight_5": 3},
+                    "pity_config": {"pity_5": 10},
+                }
+            ),
+            encoding="utf-8",
+        )
+        return group
+
+    def test_legacy_scale_is_migrated(self):
+        group = self._seed_legacy()
+        plugin = M.QuotePlugin(self.ctx, {})  # __init__ 触发迁移
+
+        names = sorted(p.name for p in group.iterdir() if p.suffix == ".jpg")
+        self.assertEqual(names, ["2.a.jpg", "4.c.jpg", "6.b.jpg"])
+
+        log = [r["filename"] for r in plugin._read_submit_log()]
+        self.assertEqual(log, ["2.a.jpg", "6.b.jpg"])
+
+        order = ENV.read_json(group / "order.json")
+        self.assertEqual(order["since"], {"1": 0, "2": 5, "3": 0, "4": 0, "5": 0, "6": 2})
+        self.assertEqual(order["recent"], ["2.a.jpg"])
+
+        settings = plugin._load_global_settings()
+        self.assertEqual(
+            {r: settings["rarity_weights"][f"weight_{r}"] for r in M.RARITY_ORDER},
+            {6: 2, 5: 8, 4: 50, 3: 40, 2: 0, 1: 0},
+        )
+        self.assertEqual(settings["pity_config"]["pity_6"], 10)
+        self.assertEqual(ENV.read_json(ENV.data_root / ".rarity_scale")["scale"], "6-star")
+
+    def test_migration_is_idempotent(self):
+        group = self._seed_legacy()
+        M.QuotePlugin(self.ctx, {})
+        before = sorted(p.name for p in group.iterdir() if p.suffix == ".jpg")
+        M.QuotePlugin(self.ctx, {})  # 第二次启动不应再改名
+        after = sorted(p.name for p in group.iterdir() if p.suffix == ".jpg")
+        self.assertEqual(before, after)
+        self.assertIn("6.b.jpg", after)
+
+
+class ManageApiTest(PluginTestBase):
+    """管理页后端：列表 / 改星级 / 删图 / 缩略图"""
+
+    def setUp(self):
+        super().setUp()
+        for name in ("3.a.jpg", "4.b.jpg", "6.c.jpg"):
+            ENV.put_image(GROUP, name)
+        self.plugin._apply_group_settings(GROUP, mode=2)
+        self.plugin._log_submission(GROUP, MEMBER, "3.a.jpg", 1)
+
+    def test_list_filter_and_paging(self):
+        ENV.request.reset({"group_id": GROUP})
+        data = run(self.plugin.web_quotes())["ok"]
+        self.assertEqual(data["total"], 3)
+        item = next(i for i in data["items"] if i["name"] == "3.a.jpg")
+        self.assertEqual(item["stars"], "★★★")
+        self.assertEqual(item["submitter"], MEMBER)
+        self.assertIn("quotes/image", item["image_url"])
+
+        ENV.request.reset({"group_id": GROUP, "rarity": 6})
+        self.assertEqual(run(self.plugin.web_quotes())["ok"]["total"], 1)
+
+        ENV.request.reset({"group_id": GROUP, "query": "b"})
+        self.assertEqual(run(self.plugin.web_quotes())["ok"]["total"], 1)
+
+        ENV.request.reset({"group_id": GROUP, "page_size": 2, "page": 2})
+        data = run(self.plugin.web_quotes())["ok"]
+        self.assertEqual((data["page"], data["pages"], len(data["items"])), (2, 2, 1))
+
+    def test_set_rarity_single_and_bulk(self):
+        ENV.request.reset({}, {"group_id": GROUP, "names": ["3.a.jpg"], "rarity": 6})
+        res = run(self.plugin.web_set_quote_rarity())["ok"]
+        self.assertEqual(res["changed"], 1)
+        self.assertTrue((ENV.group_dir(GROUP) / "6.a.jpg").exists())
+
+        ENV.request.reset(
+            {},
+            {"group_id": GROUP, "rarity": 4, "filter_rarity": 0, "filter_query": ""},
+        )
+        res = run(self.plugin.web_set_quote_rarity())["ok"]
+        names = sorted(
+            p.name for p in ENV.group_dir(GROUP).iterdir() if p.suffix == ".jpg"
+        )
+        self.assertEqual(names, ["4.a.jpg", "4.b.jpg", "4.c.jpg"])
+        self.assertEqual(res["changed"] + res["skipped"], 3)
+
+    def test_image_endpoint_and_traversal(self):
+        ENV.request.reset({"group_id": GROUP, "name": "4.b.jpg"})
+        res = run(self.plugin.web_quote_image())
+        self.assertTrue(res["file"].endswith("4.b.jpg"))
+        self.assertEqual(res["content_type"], "image/jpeg")
+
+        ENV.request.reset({"group_id": GROUP, "name": "../../settings.json"})
+        self.assertIn("err", run(self.plugin.web_quote_image()))
+
+    def test_delete_quote(self):
+        ENV.request.reset({}, {"group_id": GROUP, "names": ["4.b.jpg"]})
+        res = run(self.plugin.web_delete_quotes())["ok"]
+        self.assertEqual(res["deleted"], 1)
+        self.assertFalse((ENV.group_dir(GROUP) / "4.b.jpg").exists())
+        self.assertIsNone(self.plugin._find_submission_record(GROUP, "4.b.jpg"))
+
+    def test_invalid_params(self):
+        ENV.request.reset({"group_id": "abc"})
+        self.assertIn("err", run(self.plugin.web_quotes()))
+        ENV.request.reset({}, {"group_id": GROUP, "rarity": 9})
+        self.assertIn("err", run(self.plugin.web_set_quote_rarity()))
+        ENV.request.reset({}, {"group_id": GROUP, "names": []})
+        self.assertIn("err", run(self.plugin.web_delete_quotes()))
 
 
 if __name__ == "__main__":

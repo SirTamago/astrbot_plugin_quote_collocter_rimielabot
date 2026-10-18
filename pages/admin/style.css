@@ -5,11 +5,12 @@
   --muted: #888;
   --border: #e0e0e0;
   --accent: #4a90e2;
-  --sssr: #ff4d4f;
-  --ssr: #ff7a45;
-  --sr: #faad14;
-  --r: #52c41a;
-  --new: #8c8c8c;
+  --star6: #ff4d4f;
+  --star5: #ff7a45;
+  --star4: #faad14;
+  --star3: #52c41a;
+  --star2: #8c8c8c;
+  --star1: #bfbfbf;
 }
 
 [data-theme="dark"] {
@@ -168,8 +169,8 @@ th {
   margin-top: 8px;
 }
 .msg.ok {
-  color: var(--r);
+  color: var(--star3);
 }
 .msg.err {
-  color: var(--sssr);
+  color: var(--star6);
 }

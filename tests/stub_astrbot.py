@@ -285,6 +285,15 @@ def error_response(message, **kwargs):
     return {"err": message}
 
 
+def file_response(path=None, filename=None, content_type=None, **kwargs):
+    """文件响应桩：记录路径与 MIME，测试里断言用。"""
+    return {
+        "file": str(path) if path is not None else None,
+        "filename": filename,
+        "content_type": content_type,
+    }
+
+
 # --------------------------------------------------------------------------- #
 # 安装
 # --------------------------------------------------------------------------- #
@@ -359,6 +368,7 @@ def install(workdir: str | Path | None = None) -> Env:
         "astrbot.api.web",
         json_response=json_response,
         error_response=error_response,
+        file_response=file_response,
         request=env.request,
     )
     _make_module("astrbot.core")

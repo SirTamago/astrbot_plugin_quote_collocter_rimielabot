@@ -16,7 +16,7 @@
 与 devlog issue [#1](https://github.com/SirTamago/astrbot_plugin_quote_collocter_rimielabot/issues/1) 里的
 「补录总览 + R1–R8」评论一一对应（原本放在 issue #2，后按"单一 devlog issue"的约定合并进 #1，#2 已关闭）。
 滚动记录（每次 push 一条）同样在 issue #1。
-行号如无特别说明，均指当前 `main.py`（2037 行、CRLF）。
+行号如无特别说明，均指记录时（0.3/1.0）的 `main.py`（2037 行、CRLF）。
 
 | 轮次 | 主题 | 提交 | 版本 |
 | --- | --- | --- | --- |

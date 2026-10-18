@@ -2,12 +2,14 @@
 // 与 AstrBot Dashboard 通过 window.AstrBotPluginPage bridge 通信
 const bridge = window.AstrBotPluginPage;
 
+// 6 星刻度（明日方舟同款）：文件名首位数字 = 星级
 const RARITY_DEFS = [
-  { key: "weight_5", label: "SSSR(5)", color: "var(--sssr)" },
-  { key: "weight_4", label: "SSR(4)", color: "var(--ssr)" },
-  { key: "weight_3", label: "SR(3)", color: "var(--sr)" },
-  { key: "weight_2", label: "R(2)", color: "var(--r)" },
-  { key: "weight_1", label: "新卡(1)", color: "var(--new)" },
+  { key: "weight_6", label: "★★★★★★", color: "var(--star6)" },
+  { key: "weight_5", label: "★★★★★", color: "var(--star5)" },
+  { key: "weight_4", label: "★★★★", color: "var(--star4)" },
+  { key: "weight_3", label: "★★★", color: "var(--star3)" },
+  { key: "weight_2", label: "★★", color: "var(--star2)" },
+  { key: "weight_1", label: "★", color: "var(--star1)" },
 ];
 
 const $ = (id) => document.getElementById(id);

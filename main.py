@@ -1,16 +1,23 @@
 import json
+import mimetypes
 import os
 import random
 import re
 import time
 from pathlib import Path
+from urllib.parse import quote as urlquote
 
 import aiohttp
 import astrbot.api.message_components as Comp
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star
-from astrbot.api.web import json_response, error_response, request
+from astrbot.api.web import (
+    error_response,
+    file_response,
+    json_response,
+    request,
+)
 from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
     AiocqhttpMessageEvent,
 )
@@ -23,22 +30,30 @@ QUOTES_ROOT = Path("data") / "plugin_data" / "quote_collocter"
 # 全局设置文件（供 WebUI Page 与插件共享读写）
 GLOBAL_SETTINGS_PATH = QUOTES_ROOT / "settings.json"
 
-# 默认稀有度权重（面板与 _conf_schema.json 默认值保持一致）。
+# 稀有度刻度：1..6 星（明日方舟同款，6★ 最高）。文件名首位数字即星级。
+RARITY_ORDER = (6, 5, 4, 3, 2, 1)
+MIN_RARITY = 1
+MAX_RARITY = 6
+
+# 默认稀有度权重（明日方舟同款出率：6★ 2%、5★ 8%、4★ 50%、3★ 40%）。
 # 语义：每次抽取先按权重决定星级、再在该星级内均匀抽图，
-# 因此权重占比就是该星级的实际出率；权重 0 表示该星级不会被抽到。
+# 因此权重占比就是该星级的实际出率；权重 0 表示该星级不会被抽到
+# （默认 2★ / 1★ 不参与抽卡，只作为卡片分类保留）。
 DEFAULT_RARITY_WEIGHTS = {
-    "weight_5": 3,
-    "weight_4": 5,
-    "weight_3": 8,
-    "weight_2": 4,
-    "weight_1": 2,
+    "weight_6": 2,
+    "weight_5": 8,
+    "weight_4": 50,
+    "weight_3": 40,
+    "weight_2": 0,
+    "weight_1": 0,
 }
 
 # 默认保底配置：每 N 抽必出一次对应星级，0 表示禁用该等级保底。
-# 默认每 10 抽必出一次 5 星。保底只在本群存在「该星级或更高星级」图片时生效，
+# 默认每 10 抽必出一次 6★。保底只在本群存在「该星级或更高星级」图片时生效，
 # 否则保留计数不消耗，等有图后立即触发（不会退化成硬凑低星）。
 DEFAULT_PITY = {
-    "pity_5": 10,
+    "pity_6": 10,
+    "pity_5": 0,
     "pity_4": 0,
     "pity_3": 0,
     "pity_2": 0,
@@ -55,22 +70,31 @@ POKE_TEXTS = [
     "给我出列！",
 ]
 
-# 语录稀有度文本（对应文件名首位数字 5..1，不在映射内的数字按 1=新卡 处理）
+# 语录稀有度文本：直接显示明日方舟同款星星数量（文件名首位数字 6..1）。
 RARITY_TEXT = {
-    5: "恭喜抽到SSSR卡",
-    4: "您抽到了SSR卡",
-    3: "您抽到了SR卡",
-    2: "您抽到了R卡",
-    1: "您抽到了新卡",
+    6: "★★★★★★",
+    5: "★★★★★",
+    4: "★★★★",
+    3: "★★★",
+    2: "★★",
+    1: "★",
 }
+
+# 新投稿的默认星级：取「最低可抽档」（3★），避免新投稿落进 1★/2★ 的
+# 0 权重档而抽不到；想改默认档位改这里即可。
+DEFAULT_SUBMIT_RARITY = 3
+
+# 稀有度刻度迁移标记：0.1~1.0 用的是 1..5 档，1.1 起改为 1..6 星。
+RARITY_SCALE_MARKER = QUOTES_ROOT / ".rarity_scale"
+RARITY_SCALE_VERSION = "6-star"
 
 
 def parse_quote_rarity(filename: str) -> tuple[int, str]:
-    """解析 '<0-5>.<string>.<ext>' 格式的文件名。
+    """解析 '<1-6>.<string>.<ext>' 格式的文件名（首位数字 = 星级）。
 
-    返回 (稀有度数字, 展示名)。
+    返回 (星级, 展示名)。
     展示名 = 文件名中的 [string] + 文件扩展名。
-    不符合格式的文件名按稀有度 1（新卡）处理，展示名为去掉编号后的原文。
+    不符合格式或星级超出 1..6 的文件名按 1★ 处理，展示名为去掉编号后的原文。
     """
     p = Path(filename)
     ext = p.suffix
@@ -107,7 +131,7 @@ def format_draw_trace(trace: dict | None, verbose: bool = True) -> str:
     if not trace:
         return ""
 
-    order = (5, 4, 3, 2, 1)
+    order = RARITY_ORDER
     counts = trace.get("counts") or {}
     weights = trace.get("weights") or {}
     shares = trace.get("share") or {}
@@ -281,7 +305,7 @@ class QuoteDrawer:
 
         该档及以上都没有图时返回 None（调用方保留计数，不消耗保底）。
         """
-        for r in range(min_rarity, 6):
+        for r in range(min_rarity, MAX_RARITY + 1):
             if r in present:
                 return r
         return None
@@ -293,7 +317,7 @@ class QuoteDrawer:
             since = {}
         return {
             int(r): int(since.get(str(r), since.get(r, 0)) or 0)
-            for r in (1, 2, 3, 4, 5)
+            for r in RARITY_ORDER
         }
 
     def _recent_load(self, data: dict, image_set: set[str]) -> list[str]:
@@ -346,7 +370,7 @@ class QuoteDrawer:
 
         # 保底计数累加（只对启用保底的星级），并钳制在阈值以内，
         # 这样「本群暂时没有该档图片」时计数最多显示成 N/N，不会无限增长。
-        for r in (1, 2, 3, 4, 5):
+        for r in RARITY_ORDER:
             thr = int(self.pity.get(r, 0) or 0)
             if thr > 0:
                 since[r] = min(since.get(r, 0) + 1, thr)
@@ -356,7 +380,7 @@ class QuoteDrawer:
         target_rarity: int | None = None
         triggered_r = 0
         skipped: list[int] = []
-        for r in (5, 4, 3, 2, 1):
+        for r in RARITY_ORDER:
             thr = int(self.pity.get(r, 0) or 0)
             if thr <= 0 or since.get(r, 0) < thr:
                 continue
@@ -398,8 +422,8 @@ class QuoteDrawer:
         self.last_trace = {
             "group": self.group_dir.name,
             "total": len(images),
-            "counts": {r: len(pools.get(r, [])) for r in (1, 2, 3, 4, 5)},
-            "weights": {r: self._weight_of(r) for r in (1, 2, 3, 4, 5)},
+            "counts": {r: len(pools.get(r, [])) for r in RARITY_ORDER},
+            "weights": {r: self._weight_of(r) for r in RARITY_ORDER},
             "share": self._rarity_shares(pools),
             "window": self.window,
             "recent": list(recent),
@@ -410,10 +434,10 @@ class QuoteDrawer:
             "excluded": len(avoid),
             "pity": {
                 "thresholds": {
-                    r: int(self.pity.get(r, 0) or 0) for r in (1, 2, 3, 4, 5)
+                    r: int(self.pity.get(r, 0) or 0) for r in RARITY_ORDER
                 },
                 "since_used": dict(since_used),
-                "since_after": {r: since.get(r, 0) for r in (1, 2, 3, 4, 5)},
+                "since_after": {r: since.get(r, 0) for r in RARITY_ORDER},
                 "triggered": triggered_r or None,
                 "skipped": skipped,
             },
@@ -466,6 +490,36 @@ class QuotePlugin(Star):
             ["POST"],
             "Save per-group debug mode",
         )
+        # 语录管理页（可视化改稀有度 / 删除）
+        context.register_web_api(
+            f"/{PLUGIN_NAME}/quotes",
+            self.web_quotes,
+            ["GET"],
+            "List quotes for the management page",
+        )
+        context.register_web_api(
+            f"/{PLUGIN_NAME}/quotes/image",
+            self.web_quote_image,
+            ["GET"],
+            "Get quote image thumbnail",
+        )
+        context.register_web_api(
+            f"/{PLUGIN_NAME}/quotes/rarity",
+            self.web_set_quote_rarity,
+            ["POST"],
+            "Set quote rarity (single or bulk)",
+        )
+        context.register_web_api(
+            f"/{PLUGIN_NAME}/quotes/delete",
+            self.web_delete_quotes,
+            ["POST"],
+            "Delete quotes",
+        )
+        # 旧版本（1..5 档）→ 6 星刻度的数据迁移；有标记文件时直接跳过
+        try:
+            self._migrate_rarity_scale()
+        except Exception as e:  # 迁移失败不应阻塞插件加载
+            logger.error(f"稀有度刻度迁移失败（可手动处理）: {e}")
 
     # ------------------------------------------------------------------ #
     # 路径与持久化
@@ -580,6 +634,127 @@ class QuotePlugin(Star):
         except Exception as e:
             logger.error(f"保存群设置失败: {e}")
 
+    # ------------------------------------------------------------------ #
+    # 数据迁移：1..5 档（≤1.0）→ 1..6 星（1.1 起）
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _shift_rarity_name(name: str) -> str | None:
+        """把 'n.标题.扩展名'（n 为 1..5 的旧档）升一档；不符合旧刻度时返回 None。"""
+        head, sep, rest = name.partition(".")
+        if not sep or not head.isdigit():
+            return None
+        old = int(head)
+        if MIN_RARITY <= old <= MAX_RARITY - 1:
+            return f"{old + 1}.{rest}"
+        return None
+
+    def _migrate_order_file(self, group_dir: Path) -> None:
+        """把 order.json 的保底计数键与最近记录里的文件名一起升一档。"""
+        path = group_dir / "order.json"
+        if not path.exists():
+            return
+        try:
+            data = json.loads(path.read_text(encoding="utf-8")) or {}
+        except Exception:
+            return
+        since = data.get("since")
+        if isinstance(since, dict):
+            shifted: dict[str, int] = {}
+            for key, value in since.items():
+                try:
+                    rarity = int(key)
+                except (TypeError, ValueError):
+                    continue
+                if MIN_RARITY <= rarity <= MAX_RARITY - 1:
+                    shifted[str(rarity + 1)] = value
+            shifted.setdefault(str(MIN_RARITY), 0)
+            data["since"] = {str(r): int(shifted.get(str(r), 0) or 0) for r in RARITY_ORDER}
+        recent = data.get("recent")
+        if isinstance(recent, list):
+            data["recent"] = [
+                self._shift_rarity_name(str(name)) or str(name) for name in recent
+            ]
+        try:
+            path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        except Exception as e:
+            logger.warning(f"迁移抽卡状态失败 {path}: {e}")
+
+    def _migrate_rarity_scale(self) -> None:
+        """把旧数据从 1..5 档迁移成 1..6 星。
+
+        - 群目录图片：5.x→6.x、4.x→5.x、…、1.x→2.x（按旧档降序重命名，避免撞名）
+        - submit.log：filename 同步升档
+        - order.json：since 键 +1、recent 文件名 +1
+        - 全局 settings.json：权重/保底换成新的 6 档默认（明日方舟出率）
+        完成后写标记文件；重复调用直接返回。
+        """
+        marker = RARITY_SCALE_MARKER
+        if marker.exists():
+            try:
+                saved = json.loads(marker.read_text(encoding="utf-8")) or {}
+                if saved.get("scale") == RARITY_SCALE_VERSION:
+                    return
+            except Exception:
+                pass
+
+        renamed = 0
+        if QUOTES_ROOT.exists():
+            for group_dir in sorted(p for p in QUOTES_ROOT.iterdir() if p.is_dir()):
+                if not group_dir.name.isdigit():
+                    continue
+                for old in range(MAX_RARITY - 1, MIN_RARITY - 1, -1):
+                    for f in sorted(group_dir.iterdir()):
+                        if not f.is_file() or f.suffix.lower() not in IMAGE_EXTENSIONS:
+                            continue
+                        head, sep, rest = f.name.partition(".")
+                        if not sep or not head.isdigit() or int(head) != old:
+                            continue
+                        target = f.with_name(f"{old + 1}.{rest}")
+                        if target.exists():
+                            logger.warning(f"稀有度迁移跳过（目标已存在）: {target}")
+                            continue
+                        f.rename(target)
+                        renamed += 1
+                self._migrate_order_file(group_dir)
+
+        log_changed = 0
+        records = self._read_submit_log()
+        for record in records:
+            new_name = self._shift_rarity_name(str(record.get("filename", "")))
+            if new_name:
+                record["filename"] = new_name
+                log_changed += 1
+        if log_changed:
+            self._rewrite_submit_log(records)
+
+        if GLOBAL_SETTINGS_PATH.exists():
+            try:
+                saved = json.loads(GLOBAL_SETTINGS_PATH.read_text(encoding="utf-8")) or {}
+                saved["rarity_weights"] = dict(DEFAULT_RARITY_WEIGHTS)
+                saved["pity_config"] = dict(DEFAULT_PITY)
+                self._save_global_settings(saved)
+            except Exception as e:
+                logger.warning(f"迁移全局设置失败: {e}")
+
+        try:
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.write_text(
+                json.dumps(
+                    {
+                        "scale": RARITY_SCALE_VERSION,
+                        "migrated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+        except Exception as e:
+            logger.warning(f"写入迁移标记失败: {e}")
+        logger.info(
+            f"稀有度刻度已迁移为 1..6 星：重命名 {renamed} 张图片、"
+            f"更新 {log_changed} 条投稿记录"
+        )
+
     def _load_rarity_weights(self) -> dict:
         """优先从全局设置读取稀有度权重，整理成 {稀有度数字: 权重}。
 
@@ -589,7 +764,7 @@ class QuotePlugin(Star):
         gs = self._load_global_settings()
         raw = gs.get("rarity_weights") or DEFAULT_RARITY_WEIGHTS
         out: dict[int, float] = {}
-        for rarity in (1, 2, 3, 4, 5):
+        for rarity in RARITY_ORDER:
             key = f"weight_{rarity}"
             try:
                 out[rarity] = max(
@@ -600,11 +775,11 @@ class QuotePlugin(Star):
         return out
 
     def _load_pity(self) -> dict:
-        """从全局设置读取保底配置，整理成 {稀有度数字: 每 N 抽必出, 0=禁用}。"""
+        """从全局设置读取保底配置，整理成 {星级: 每 N 抽必出, 0=禁用}。"""
         gs = self._load_global_settings()
         raw = gs.get("pity_config") or DEFAULT_PITY
         out = {}
-        for r in (1, 2, 3, 4, 5):
+        for r in RARITY_ORDER:
             key = f"pity_{r}"
             try:
                 out[r] = max(0, int(raw.get(key, DEFAULT_PITY.get(key, 0)) or 0))
@@ -909,7 +1084,7 @@ class QuotePlugin(Star):
         return self._quote_info_text(group_id, path)
 
     def _list_quote_files(self, group_id: str, rarity: int = 0) -> list[Path]:
-        """列出本群语录，可按 1-5 星筛选，并按文件名稳定排序。"""
+        """列出本群语录，可按 1-6 星筛选，并按文件名稳定排序。"""
         d = self._group_dir(group_id)
         if not d.exists():
             return []
@@ -923,7 +1098,7 @@ class QuotePlugin(Star):
         return sorted(files, key=lambda path: path.name)
 
     def _existing_displays(self, group_id: str) -> set[str]:
-        """返回该群已存在的「标题+扩展名」集合（忽略稀有度前缀 1-5）。"""
+        """返回该群已存在的「标题+扩展名」集合（忽略稀有度前缀 1-6）。"""
         d = self._group_dir(group_id)
         out: set[str] = set()
         if not d.exists():
@@ -1022,7 +1197,7 @@ class QuotePlugin(Star):
     ) -> tuple[bool, str]:
         """修改语录稀有度前缀，并同步投稿日志。"""
         if rarity not in RARITY_TEXT:
-            return False, "⭐稀有度只能是 1-5"
+            return False, "⭐稀有度只能是 1-6"
         ext = target.suffix
         stem = target.stem.split(".", 1)[1] if "." in target.stem else target.stem
         new_path = target.with_name(f"{rarity}.{stem}{ext}")
@@ -1077,7 +1252,7 @@ class QuotePlugin(Star):
         stem = title.strip() or time.strftime(
             "%Y年%m月%d日%H:%M的投稿", time.localtime(ts)
         )
-        filename = f"1.{stem}{ext}"
+        filename = f"{DEFAULT_SUBMIT_RARITY}.{stem}{ext}"
         if f"{stem}{ext}" in self._existing_displays(group_id):
             return False, f"⭐投稿失败：已存在同名语录「{stem}」，请改个标题重试"
 
@@ -1442,15 +1617,15 @@ class QuotePlugin(Star):
 
         if not target or not rarity:
             yield event.plain_result(
-                "⭐用法：/语录改稀有 <名称> <1-5>；\n"
-                "或回复 bot 的语录卡片后发送 /语录改稀有 <1-5>"
+                "⭐用法：/语录改稀有 <名称> <1-6>；\n"
+                "或回复 bot 的语录卡片后发送 /语录改稀有 <1-6>"
             )
             event.stop_event()
             return
         try:
             r = int(rarity)
         except ValueError:
-            yield event.plain_result("⭐稀有度必须是 1-5 的整数")
+            yield event.plain_result("⭐稀有度必须是 1-6 的整数")
             event.stop_event()
             return
         _, text = self._set_quote_rarity_file(group_id, target, r)
@@ -1587,7 +1762,8 @@ class QuotePlugin(Star):
             int(settings.get("mode", 0)), "未知"
         )
         rarity_text = "、".join(
-            f"{rarity}星 {counts[rarity]} 张" for rarity in sorted(counts, reverse=True)
+            f"{RARITY_TEXT[rarity]} {counts[rarity]} 张"
+            for rarity in sorted(counts, reverse=True)
         )
         return (
             f"本群语录共 {len(files)} 张\n"
@@ -1677,7 +1853,7 @@ class QuotePlugin(Star):
                 weights = payload["rarity_weights"]
                 if not isinstance(weights, dict):
                     return False, "rarity_weights 必须是对象", cur
-                for key in ("weight_5", "weight_4", "weight_3", "weight_2", "weight_1"):
+                for key in (f"weight_{r}" for r in RARITY_ORDER):
                     if key in weights:
                         value = float(weights[key])
                         if value < 0:
@@ -1687,7 +1863,7 @@ class QuotePlugin(Star):
                 pity = payload["pity_config"]
                 if not isinstance(pity, dict):
                     return False, "pity_config 必须是对象", cur
-                for key in ("pity_5", "pity_4", "pity_3", "pity_2", "pity_1"):
+                for key in (f"pity_{r}" for r in RARITY_ORDER):
                     if key in pity:
                         value = int(pity[key])
                         if value < 0:
@@ -1717,7 +1893,7 @@ class QuotePlugin(Star):
         """查看当前群的语录列表，支持按稀有度筛选和分页。
 
         Args:
-            rarity(number): 稀有度筛选，0为全部，1到5为对应星级
+            rarity(number): 星级筛选，0为全部，1到6为对应星级
             page(number): 页码，从1开始
             page_size(number): 每页条数，1到50
         """
@@ -1732,7 +1908,7 @@ class QuotePlugin(Star):
             page_size = min(50, max(1, int(page_size)))
         except (TypeError, ValueError):
             return "rarity、page 和 page_size 必须是整数。"
-        if rarity not in (0, 1, 2, 3, 4, 5):
+        if rarity not in (0, *RARITY_ORDER):
             return "rarity 必须是 0 到 5 之间的整数。"
         files = self._list_quote_files(group_id, rarity)
         total = len(files)
@@ -1748,7 +1924,7 @@ class QuotePlugin(Star):
             quote_rarity, display = parse_quote_rarity(path.name)
             record = self._find_submission_record(group_id, path.name)
             submitter = f"，投稿人 {record.get('user_id')}" if record else ""
-            lines.append(f"{index}. [{quote_rarity}星] {display}{submitter}")
+            lines.append(f"{index}. [{RARITY_TEXT[quote_rarity]}] {display}{submitter}")
         return "\n".join(lines)
 
     @filter.llm_tool(name="quote_view")
@@ -1852,7 +2028,7 @@ class QuotePlugin(Star):
 
         Args:
             name(string): 语录名称
-            rarity(number): 目标稀有度，1到5
+            rarity(number): 目标星级，1到6
         """
         group_id = self._tool_group_id(event)
         if not group_id:
@@ -2035,3 +2211,188 @@ class QuotePlugin(Star):
     async def terminate(self):
         """插件卸载时调用。"""
         self._drawers.clear()
+
+    # ------------------------------------------------------------------ #
+    # WebUI Page 后端 API：语录管理页（表格 / 改星级 / 删除 / 缩略图）
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _as_int(value, default: int = 0) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _names_from_payload(payload: dict) -> list[str]:
+        names = payload.get("names") or []
+        if isinstance(names, str):
+            names = [names]
+        return [str(name) for name in names if str(name).strip()]
+
+    def _match_quotes(
+        self, group_id: str, rarity: int = 0, query: str = ""
+    ) -> list[Path]:
+        """按星级与关键词筛选本群语录（文件名或展示名包含关键词）。"""
+        files = self._list_quote_files(group_id, rarity if rarity in RARITY_TEXT else 0)
+        needle = query.strip().lower()
+        if needle:
+            files = [
+                path
+                for path in files
+                if needle in path.name.lower()
+                or needle in parse_quote_rarity(path.name)[1].lower()
+            ]
+        return files
+
+    def _quote_rows(
+        self,
+        group_id: str,
+        rarity: int = 0,
+        query: str = "",
+        page: int = 1,
+        page_size: int = 20,
+    ) -> dict:
+        """管理页表格数据：分页 + 星级/关键词筛选 + 缩略图 URL + 投稿信息。"""
+        files = self._match_quotes(group_id, rarity, query)
+        total = len(files)
+        page_size = max(1, min(100, page_size))
+        pages = max(1, (total + page_size - 1) // page_size)
+        page = max(1, min(page, pages))
+        items = []
+        for path in files[(page - 1) * page_size : page * page_size]:
+            rarity_value, display = parse_quote_rarity(path.name)
+            record = self._find_submission_record(group_id, path.name) or {}
+            items.append(
+                {
+                    "name": path.name,
+                    "display": display,
+                    "rarity": rarity_value,
+                    "stars": RARITY_TEXT[rarity_value],
+                    "size": path.stat().st_size,
+                    "submitter": record.get("user_id", ""),
+                    "time": record.get("time", ""),
+                    "image_url": (
+                        f"/{PLUGIN_NAME}/quotes/image"
+                        f"?group_id={urlquote(group_id)}"
+                        f"&name={urlquote(path.name)}"
+                    ),
+                }
+            )
+        return {
+            "group_id": group_id,
+            "total": total,
+            "page": page,
+            "pages": pages,
+            "page_size": page_size,
+            "items": items,
+        }
+
+    async def web_quotes(self):
+        """分页列出某群语录（管理页表格）。"""
+        group_id = str(request.query.get("group_id") or "").strip()
+        if not group_id.isdigit():
+            return error_response("请填写数字群号")
+        rarity = self._as_int(request.query.get("rarity", 0, type=int), 0)
+        if rarity not in (0, *RARITY_ORDER):
+            return error_response("rarity 必须是 0 或 1-6")
+        query = str(request.query.get("query") or "")
+        page = self._as_int(request.query.get("page", 1, type=int), 1) or 1
+        page_size = self._as_int(request.query.get("page_size", 20, type=int), 20) or 20
+        return json_response(
+            self._quote_rows(group_id, rarity, query, page, page_size)
+        )
+
+    async def web_quote_image(self):
+        """返回语录图片本体，供管理页缩略图使用（只允许群目录内的文件）。"""
+        group_id = str(request.query.get("group_id") or "").strip()
+        name = str(request.query.get("name") or "").strip()
+        if not group_id.isdigit() or not name:
+            return error_response("参数不完整")
+        target = self._find_quote_file(group_id, name)
+        if not target:
+            return error_response("未找到该语录", status_code=404)
+        try:
+            target.resolve().relative_to(self._group_dir(group_id).resolve())
+        except (ValueError, OSError):
+            return error_response("非法路径", status_code=400)
+        mime = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
+        return file_response(target, content_type=mime)
+
+    async def web_set_quote_rarity(self):
+        """把一批语录（或「当前筛选的全部」）改成指定星级。
+
+        body: ``{group_id, rarity, names?: [...], filter_rarity?, filter_query?,
+        page?, page_size?}``；给了 names 就只改这些，否则按筛选条件批量改。
+        """
+        payload = await request.json(default={})
+        if not isinstance(payload, dict):
+            return error_response("请求体必须是 JSON 对象")
+        group_id = str(payload.get("group_id") or "").strip()
+        if not group_id.isdigit():
+            return error_response("请填写数字群号")
+        rarity = self._as_int(payload.get("rarity"), -1)
+        if rarity not in RARITY_TEXT:
+            return error_response("rarity 必须是 1-6 的整数")
+
+        names = self._names_from_payload(payload)
+        filter_rarity = self._as_int(payload.get("filter_rarity"), 0)
+        filter_query = str(payload.get("filter_query") or "")
+        if names:
+            targets = [
+                found
+                for found in (self._find_quote_file(group_id, name) for name in names)
+                if found
+            ]
+        else:
+            targets = self._match_quotes(group_id, filter_rarity, filter_query)
+
+        changed = skipped = 0
+        failed: list[str] = []
+        for path in targets:
+            ok, text = self._set_quote_rarity_file(group_id, path, rarity)
+            if not ok:
+                failed.append(text)
+            elif "无需修改" in text:
+                skipped += 1
+            else:
+                changed += 1
+        return json_response(
+            {
+                "total": len(targets),
+                "changed": changed,
+                "skipped": skipped,
+                "failed": failed,
+                "rows": self._quote_rows(
+                    group_id,
+                    filter_rarity,
+                    filter_query,
+                    self._as_int(payload.get("page"), 1) or 1,
+                    self._as_int(payload.get("page_size"), 20) or 20,
+                ),
+            }
+        )
+
+    async def web_delete_quotes(self):
+        """删除一批语录（连带投稿记录与抽卡队列重建）。"""
+        payload = await request.json(default={})
+        if not isinstance(payload, dict):
+            return error_response("请求体必须是 JSON 对象")
+        group_id = str(payload.get("group_id") or "").strip()
+        if not group_id.isdigit():
+            return error_response("请填写数字群号")
+        names = self._names_from_payload(payload)
+        if not names:
+            return error_response("names 不能为空")
+        deleted = 0
+        failed: list[str] = []
+        for name in names:
+            found = self._find_quote_file(group_id, name)
+            if not found:
+                failed.append(f"未找到 {name}")
+                continue
+            ok, text = self._delete_quote_file(group_id, found)
+            if ok:
+                deleted += 1
+            else:
+                failed.append(text)
+        return json_response({"deleted": deleted, "failed": failed})
