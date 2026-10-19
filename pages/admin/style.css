@@ -346,3 +346,18 @@ button.danger {
   gap: 12px;
   font-size: 12px;
 }
+
+/* ---- 确认框 / 行内改名 ---- */
+.confirm-body {
+  max-width: 380px;
+  min-width: 260px;
+}
+.confirm-body p {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.6;
+}
+.title-input {
+  width: 100%;
+  font-size: 13px;
+}

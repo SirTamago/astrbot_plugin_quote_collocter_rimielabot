@@ -67,6 +67,25 @@ function humanSize(bytes) {
   return `${(bytes / 1024 / 1024).toFixed(2)} MB`;
 }
 
+// ---------------------------------------------------------------- 确认框
+// iframe 里 window.confirm/prompt 会被 sandbox 静默拦掉，改用页面内确认框
+let confirmResolve = null;
+
+function askConfirm(text) {
+  $("q_confirm_text").textContent = text;
+  $("q_confirm").hidden = false;
+  return new Promise((resolve) => {
+    confirmResolve = resolve;
+  });
+}
+
+function closeConfirm(result) {
+  $("q_confirm").hidden = true;
+  const resolve = confirmResolve;
+  confirmResolve = null;
+  if (resolve) resolve(result);
+}
+
 function selectedNames() {
   return [...document.querySelectorAll("#q_rows input.row-check:checked")].map(
     (el) => el.dataset.name,
@@ -156,7 +175,7 @@ function renderRows() {
     const rename = document.createElement("button");
     rename.textContent = "改名";
     rename.className = "link";
-    rename.addEventListener("click", () => renameQuote(item));
+    rename.addEventListener("click", () => startRename(tdTitle, item));
     const del = document.createElement("button");
     del.textContent = "删除";
     del.className = "link danger";
@@ -261,7 +280,8 @@ async function applyFiltered(rarity) {
     return;
   }
   const scope = `${q.rarity ? stars(q.rarity) : "全部星级"}${q.query ? `、含「${q.query}」` : ""}`;
-  if (!window.confirm(`把「${scope}」的全部 ${q.total} 张改成 ${stars(rarity)}？`)) return;
+  const ok = await askConfirm(`把「${scope}」的全部 ${q.total} 张改成 ${stars(rarity)}？`);
+  if (!ok) return;
   try {
     const res = await bridge.apiPost("quotes/rarity", queryPayload({ rarity }));
     applyRows(res.rows);
@@ -297,26 +317,58 @@ function closePreview() {
   $("q_modal_img").removeAttribute("src");
 }
 
-async function renameQuote(item) {
+function startRename(tdTitle, item) {
+  if (tdTitle.querySelector("input")) return;
   const dot = item.display.lastIndexOf(".");
   const current = dot > 0 ? item.display.slice(0, dot) : item.display;
-  const next = window.prompt(`把 ${stars(item.rarity)} 的标题改成：`, current);
-  if (next === null) return;
-  const title = next.trim();
-  if (!title || title === current) return;
+  const input = document.createElement("input");
+  input.className = "title-input";
+  input.value = current;
+  tdTitle.replaceChildren(input);
+  input.focus();
+  input.select();
+  let done = false;
+  const finish = (save) => {
+    if (done) return;
+    done = true;
+    const title = input.value.trim();
+    if (!save || !title || title === current) {
+      renderRows();
+      return;
+    }
+    submitRename(item, title);
+  };
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      finish(true);
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      finish(false);
+    }
+  });
+  input.addEventListener("blur", () => finish(true));
+}
+
+async function submitRename(item, title) {
   try {
-    const res = await bridge.apiPost("quotes/rename", queryPayload({ name: item.name, new_title: title }));
+    const res = await bridge.apiPost(
+      "quotes/rename",
+      queryPayload({ name: item.name, new_title: title }),
+    );
     applyRows(res.rows);
     qMsg(res.message || "已改名");
   } catch (e) {
     qMsg(`改名失败：${e.message}`, false);
+    renderRows();
   }
 }
 
 async function deleteQuotes(names, label = "") {
   if (!names.length) return;
   const what = label ? `「${label}」` : `${names.length} 张语录`;
-  if (!window.confirm(`确定删除${what}？会同时删除投稿记录，不可恢复。`)) return;
+  const ok = await askConfirm(`确定删除${what}？会同时删除投稿记录，不可恢复。`);
+  if (!ok) return;
   try {
     const res = await bridge.apiPost("quotes/delete", { group_id: q.groupId, names });
     await loadQuotes(q.page);
@@ -334,7 +386,8 @@ async function resetStats() {
     qMsg("请先查询一个群", false);
     return;
   }
-  if (!window.confirm("清零本群累计出货计数？（不影响保底计数与图库）")) return;
+  const ok = await askConfirm("清零本群累计出货计数？（不影响保底计数与图库）");
+  if (!ok) return;
   try {
     await bridge.apiPost("quotes/stats/reset", { group_id: q.groupId });
     qMsg("已清零本群出货计数");
@@ -401,12 +454,19 @@ async function main() {
     deleteQuotes(names);
   });
   $("q_reset_stats").addEventListener("click", resetStats);
+  $("q_confirm_ok").addEventListener("click", () => closeConfirm(true));
+  $("q_confirm_cancel").addEventListener("click", () => closeConfirm(false));
+  $("q_confirm").addEventListener("click", (e) => {
+    if (e.target === $("q_confirm")) closeConfirm(false);
+  });
   $("q_modal_close").addEventListener("click", closePreview);
   $("q_modal").addEventListener("click", (e) => {
     if (e.target === $("q_modal")) closePreview();
   });
   document.addEventListener("keydown", (e) => {
-    if (e.key === "Escape" && !$("q_modal").hidden) closePreview();
+    if (e.key !== "Escape") return;
+    if (!$("q_confirm").hidden) closeConfirm(false);
+    else if (!$("q_modal").hidden) closePreview();
   });
 
   $("q_prev").addEventListener("click", () => {
