@@ -282,13 +282,16 @@ class TraceTest(unittest.TestCase):
 
 
 class ArknightsDefaultTest(unittest.TestCase):
-    """默认配置就是明日方舟同款：6★ 2% / 5★ 8% / 4★ 50% / 3★ 40%，2★/1★ 不抽。"""
+    """默认配置：6★ 约 2% / 5★ 约 8% / 4★ 约 50% / 3★ 约 40%，1★/2★ 少量但可抽。"""
 
-    def test_default_weights_are_arknights(self):
+    def test_default_weights(self):
         self.assertEqual(
             {r: M.DEFAULT_RARITY_WEIGHTS[f"weight_{r}"] for r in M.RARITY_ORDER},
-            {6: 2, 5: 8, 4: 50, 3: 40, 2: 0, 1: 0},
+            {6: 2, 5: 8, 4: 50, 3: 40, 2: 1, 1: 0.1},
         )
+        # 1.6 起最低两档必须可抽
+        self.assertGreater(M.DEFAULT_RARITY_WEIGHTS["weight_2"], 0)
+        self.assertGreater(M.DEFAULT_RARITY_WEIGHTS["weight_1"], 0)
         self.assertEqual(M.DEFAULT_PITY["pity_6"], 10)
         self.assertEqual(M.DEFAULT_SUBMIT_RARITY, 3)  # 新投稿落在最低可抽档
 
@@ -303,8 +306,10 @@ class ArknightsDefaultTest(unittest.TestCase):
         self.assertAlmostEqual(got[5], 0.08, delta=0.015)
         self.assertAlmostEqual(got[4], 0.50, delta=0.02)
         self.assertAlmostEqual(got[3], 0.40, delta=0.02)
-        self.assertEqual(got[2], 0)
-        self.assertEqual(got[1], 0)
+        self.assertGreater(got[2], 0.005)   # 约 1%
+        self.assertLess(got[2], 0.015)
+        self.assertGreater(got[1], 0)       # 约 0.1%
+        self.assertLess(got[1], 0.004)
 
     def test_star_labels_are_six_tiers(self):
         self.assertEqual(

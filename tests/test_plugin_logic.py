@@ -526,7 +526,7 @@ class MigrationTest(PluginTestBase):
         settings = plugin._load_global_settings()
         self.assertEqual(
             {r: settings["rarity_weights"][f"weight_{r}"] for r in M.RARITY_ORDER},
-            {6: 2, 5: 8, 4: 50, 3: 40, 2: 0, 1: 0},
+            {6: 2, 5: 8, 4: 50, 3: 40, 2: 1, 1: 0.1},
         )
         self.assertEqual(settings["pity_config"]["pity_6"], 10)
         self.assertEqual(ENV.read_json(ENV.data_root / ".rarity_scale")["scale"], "6-star")
@@ -689,6 +689,46 @@ class QuoteImageApiTest(PluginTestBase):
 
         ENV.request.reset({"group_id": GROUP, "name": "不存在.jpg"})
         self.assertIn("err", run(self.plugin.web_quote_full()))
+
+
+class WeightsUpgradeTest(PluginTestBase):
+    """1.6：旧默认权重（2★/1★ 为 0）自动升级，自定义权重不动。"""
+
+    def _seed(self, weights):
+        path = ENV.data_root / "settings.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({"rarity_weights": {f"weight_{r}": weights[r] for r in M.RARITY_ORDER}}),
+            encoding="utf-8",
+        )
+        marker = ENV.data_root / ".weights_rev"
+        if marker.exists():
+            marker.unlink()
+
+    def test_legacy_default_is_upgraded(self):
+        self._seed({6: 2, 5: 8, 4: 50, 3: 40, 2: 0, 1: 0})
+        plugin = M.QuotePlugin(self.ctx, {})
+        saved = plugin._load_rarity_weights()
+        self.assertGreater(saved[2], 0)
+        self.assertGreater(saved[1], 0)
+        self.assertEqual((saved[6], saved[5], saved[4], saved[3]), (2, 8, 50, 40))
+
+    def test_custom_weights_are_untouched(self):
+        custom = {6: 19, 5: 110, 4: 370, 3: 490, 2: 10, 1: 1}
+        self._seed(custom)
+        plugin = M.QuotePlugin(self.ctx, {})
+        self.assertEqual(plugin._load_rarity_weights(), custom)
+
+    def test_upgrade_runs_once(self):
+        self._seed({6: 2, 5: 8, 4: 50, 3: 40, 2: 0, 1: 0})
+        M.QuotePlugin(self.ctx, {})
+        # 标记已写入；此时手动改回旧值也不应再被自动改
+        path = ENV.data_root / "settings.json"
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data["rarity_weights"] = {f"weight_{r}": 0 for r in M.RARITY_ORDER}
+        path.write_text(json.dumps(data), encoding="utf-8")
+        plugin = M.QuotePlugin(self.ctx, {})
+        self.assertEqual(plugin._load_rarity_weights()[1], 0)
 
 
 if __name__ == "__main__":

@@ -42,17 +42,17 @@ RARITY_ORDER = (6, 5, 4, 3, 2, 1)
 MIN_RARITY = 1
 MAX_RARITY = 6
 
-# 默认稀有度权重（明日方舟同款出率：6★ 2%、5★ 8%、4★ 50%、3★ 40%）。
+# 默认稀有度权重（6★ 约 2%、5★ 约 8%、4★ 约 50%、3★ 约 40%）。
 # 语义：每次抽取先按权重决定星级、再在该星级内均匀抽图，
-# 因此权重占比就是该星级的实际出率；权重 0 表示该星级不会被抽到
-# （默认 2★ / 1★ 不参与抽卡，只作为卡片分类保留）。
+# 因此权重占比就是该星级的实际出率；权重 0 表示该星级不会被抽到。
+# 1.6 起 2★（1%）与 1★（0.1%）也参与抽卡。
 DEFAULT_RARITY_WEIGHTS = {
     "weight_6": 2,
     "weight_5": 8,
     "weight_4": 50,
     "weight_3": 40,
-    "weight_2": 0,
-    "weight_1": 0,
+    "weight_2": 1,
+    "weight_1": 0.1,
 }
 
 # 默认保底配置：每 N 抽必出一次对应星级，0 表示禁用该等级保底。
@@ -533,6 +533,10 @@ class QuotePlugin(Star):
             self._migrate_rarity_scale()
         except Exception as e:  # 迁移失败不应阻塞插件加载
             logger.error(f"稀有度刻度迁移失败（可手动处理）: {e}")
+        try:
+            self._migrate_default_weights()
+        except Exception as e:
+            logger.error(f"默认权重迁移失败（可手动处理）: {e}")
 
     # ------------------------------------------------------------------ #
     # 路径与持久化
@@ -767,6 +771,43 @@ class QuotePlugin(Star):
             f"稀有度刻度已迁移为 1..6 星：重命名 {renamed} 张图片、"
             f"更新 {log_changed} 条投稿记录"
         )
+
+    # 1.1–1.5 的旧默认权重（2★ / 1★ 为 0，不参与抽卡）
+    _LEGACY_DEFAULT_WEIGHTS = {6: 2, 5: 8, 4: 50, 3: 40, 2: 0, 1: 0}
+
+    def _migrate_default_weights(self) -> None:
+        """把「仍原样保留旧默认权重」的全局设置升级为新默认。
+
+        只在这六项权重与旧默认完全一致时改写；用户自定义过权重的配置不动。
+        用 ``.weights_rev`` 标记保证只迁移一次。
+        """
+        marker = QUOTES_ROOT / ".weights_rev"
+        if marker.exists():
+            return
+        if GLOBAL_SETTINGS_PATH.exists():
+            try:
+                saved = json.loads(GLOBAL_SETTINGS_PATH.read_text(encoding="utf-8")) or {}
+            except Exception:
+                saved = {}
+            weights = saved.get("rarity_weights")
+            if isinstance(weights, dict) and all(
+                f"weight_{r}" in weights for r in RARITY_ORDER
+            ):
+                try:
+                    current = {r: float(weights[f"weight_{r}"]) for r in RARITY_ORDER}
+                except (TypeError, ValueError):
+                    current = None
+                if current == self._LEGACY_DEFAULT_WEIGHTS:
+                    saved["rarity_weights"] = dict(DEFAULT_RARITY_WEIGHTS)
+                    self._save_global_settings(saved)
+                    logger.info("默认权重已升级：2★ / 1★ 开始参与抽卡")
+        try:
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.write_text(
+                json.dumps({"version": 2}, ensure_ascii=False), encoding="utf-8"
+            )
+        except Exception as e:
+            logger.warning(f"写入权重迁移标记失败: {e}")
 
     def _load_rarity_weights(self) -> dict:
         """优先从全局设置读取稀有度权重，整理成 {稀有度数字: 权重}。
