@@ -113,6 +113,36 @@ jobs:
           echo "num=$num" >> "$GITHUB_OUTPUT"
           echo "使用 issue #$num"
 
+      - name: 取出当前版本的更新日志
+        if: steps.guard.outputs.skip != 'true'
+        id: changelog
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+        run: |
+          set -euo pipefail
+          # 工作流没有 checkout 仓库，用 Contents API 按本次 head 取文件
+          fetch() {
+            gh api -H "Accept: application/vnd.github.raw" \
+              "repos/$GITHUB_REPOSITORY/contents/$1?ref=$GITHUB_SHA" 2>/dev/null || true
+          }
+          meta=$(fetch metadata.yaml)
+          changelog=$(fetch CHANGELOG.md)
+          VER=$(printf '%s\n' "$meta" | grep -E '^version:' | head -1 \
+            | sed -E 's/^version:[[:space:]]*//; s/[[:space:]]*#.*$//; s/^v//')
+          echo "ver=$VER" >> "$GITHUB_OUTPUT"
+          : > /tmp/changelog.md
+          if [ -n "$VER" ] && [ -n "$changelog" ]; then
+            printf '%s\n' "$changelog" | awk -v ver="$VER" '
+              $0 ~ "^## " ver "[[:space:]]*$" {found=1; next}
+              found && /^## / {exit}
+              found {print}
+            ' > /tmp/changelog.raw
+            # 去掉首尾空行
+            awk 'BEGIN{n=0} {lines[n++]=$0} END{last=n-1; while(last>=0 && lines[last]=="") last--; for(i=0;i<=last;i++) print lines[i]}' \
+              /tmp/changelog.raw > /tmp/changelog.md
+            echo "更新日志 v${VER}：$(wc -l < /tmp/changelog.md) 行"
+          fi
+
       - name: 记录工作段（追加评论或新建 issue）
         if: steps.guard.outputs.skip != 'true'
         env:
@@ -127,6 +157,7 @@ jobs:
           COMMITS: ${{ toJSON(github.event.commits) }}
           NOTE: ${{ github.event.inputs.note }}
           NEW_TITLE: ${{ github.event.inputs.new_issue_title }}
+          VER: ${{ steps.changelog.outputs.ver }}
         run: |
           set -euo pipefail
 
@@ -154,6 +185,12 @@ jobs:
                 echo "| \`${AFTER:0:7}\` | — | （本次没有提交明细） |"
               else
                 echo "${COMMITS}" | jq -r '.[] | "| `\(.id[0:7])` | \(.author.name // .author.username // "?") | \(.message | split("\n")[0] | gsub("\\|"; "\\|")) |"'
+              fi
+              if [ -s /tmp/changelog.md ]; then
+                echo
+                echo "**版本更新 · v${VER:-?}**（同步自 \`CHANGELOG.md\`）"
+                echo
+                cat /tmp/changelog.md
               fi
             } > /tmp/entry.md
           fi
