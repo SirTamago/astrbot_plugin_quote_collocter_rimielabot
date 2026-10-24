@@ -103,6 +103,36 @@ THUMB_SIZE = (160, 120)
 # /语录统计 导出的 CSV 通过私聊发给这个 QQ（管理员）
 STATS_RECEIVER_QQ = "2632364603"
 
+# /语录help 的内容（按权限分组，改指令时记得同步这里）
+COMMAND_HELP = (
+    (
+        "全体成员",
+        (
+            ("/语录", "随机抽一张本群语录（别名 /随机语录）"),
+            ("/语录投稿 [标题]", "回复一张图片投稿，标题可选"),
+            ("/撤回投稿 [名称]", "撤回自己的投稿，不带名称时撤回最近一条"),
+            ("/语录状态", "本群总数、各星级张数、权限与冷却（别名 /投稿状态）"),
+        ),
+    ),
+    (
+        "管理员",
+        (
+            ("/语录help", "这张指令表（别名 /语录帮助）"),
+            ("/语录查看 <名称>", "直接查看指定语录，不影响抽卡状态"),
+            ("/语录删除 <名称>", "删除语录，也可回复 bot 的卡片后直接发"),
+            ("/语录改名 <旧名称> <新标题>", "只改标题，保留星级与扩展名"),
+            ("/语录改稀有 <名称> <1-6>", "修改星级"),
+            ("/语录出货 [页码]", "每张图被抽中的次数与占比（别名 /出货统计）"),
+            ("/语录统计", "导出全部统计为 CSV，私聊发给管理员"),
+            ("/语录拉黑 @用户 或 <UID>", "全局拉黑：不能投稿或抽卡"),
+            ("/语录解封 @用户 或 <UID>", "解除拉黑"),
+            ("/投稿权限 <0|1|2>", "0 关闭 / 1 仅管理员 / 2 全体成员"),
+            ("/戳戳冷却 <秒>", "戳一戳触发语录的冷却时间（别名 /语录冷却）"),
+            ("/语录调试 <0|1|2>", "0 关闭 / 1 写日志 / 2 日志 + 卡片附注"),
+        ),
+    ),
+)
+
 
 def parse_quote_rarity(filename: str) -> tuple[int, str]:
     """解析 '<1-6>.<string>.<ext>' 格式的文件名（首位数字 = 星级）。
@@ -1522,6 +1552,22 @@ class QuotePlugin(Star):
         if pages > 1:
             nxt = page_no + 1 if page_no < pages else 1
             lines.append(f"第 {page_no}/{pages} 页，发送 /语录出货 {nxt} 翻页")
+        yield event.plain_result("\n".join(lines))
+        event.stop_event()
+
+    @filter.command("语录help", alias={"语录帮助", "语录指令"})
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
+    async def quote_help(self, event: AstrMessageEvent):
+        """查看所有语录指令与用法（仅管理员可用）"""
+        lines = ["⭐群友语录 · 指令一览"]
+        for group, items in COMMAND_HELP:
+            lines.append("")
+            lines.append(f"【{group}】")
+            for usage, desc in items:
+                lines.append(f"  {usage}  —— {desc}")
+        lines.append("")
+        lines.append("提示：管理类指令的权限/启停可在 AstrBot 面板「插件 → 管理行为 → 指令」里调整。")
         yield event.plain_result("\n".join(lines))
         event.stop_event()
 

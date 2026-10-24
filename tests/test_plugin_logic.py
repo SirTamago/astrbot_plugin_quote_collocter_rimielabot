@@ -822,5 +822,21 @@ class StatsExportTest(PluginTestBase):
         self.assertEqual(ev.bot.api.calls[-1][0], "upload_group_file")
 
 
+class HelpCommandTest(PluginTestBase):
+    """/语录help：列出全部指令与用法（默认仅管理员）。"""
+
+    def test_lists_every_command(self):
+        text = first_text(drive(self.plugin.quote_help(event())))
+        self.assertIn("指令一览", text)
+        self.assertIn("【管理员】", text)
+        for command in (
+            "/语录", "/语录投稿", "/撤回投稿", "/语录状态",
+            "/语录help", "/语录查看", "/语录删除", "/语录改名",
+            "/语录改稀有", "/语录出货", "/语录统计", "/语录拉黑",
+            "/语录解封", "/投稿权限", "/戳戳冷却", "/语录调试",
+        ):
+            self.assertIn(command, text)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
