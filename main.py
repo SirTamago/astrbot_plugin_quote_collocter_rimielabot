@@ -165,6 +165,22 @@ def format_draw_trace(trace: dict | None) -> str:
     return "\n".join(lines)
 
 
+def load_hits(data: dict, image_set: set[str] | None = None) -> dict:
+    """读取每张图片的累计被抽中次数；给 image_set 时丢弃已删除的文件。"""
+    raw = data.get("hits") or {}
+    if not isinstance(raw, dict):
+        raw = {}
+    hits: dict[str, int] = {}
+    for name, count in raw.items():
+        if image_set is not None and name not in image_set:
+            continue
+        try:
+            hits[str(name)] = int(count)
+        except (TypeError, ValueError):
+            continue
+    return hits
+
+
 class QuoteDrawer:
     """群聊语录抽取器（独立同分布模型 / IID）。
 
@@ -402,12 +418,17 @@ class QuoteDrawer:
         stats = self._stats_load(data)
         stats[out_r] = stats.get(out_r, 0) + 1
 
+        # 每张图片的累计被抽中次数（用于 /语录出货）
+        hits = load_hits(data, set(images))
+        hits[target] = hits.get(target, 0) + 1
+
         recent = (recent + [target])[-self.window :] if self.window > 0 else []
         self._save(
             {
                 "since": {str(k): v for k, v in since.items()},
                 "recent": recent,
                 "stats": {str(k): v for k, v in stats.items()},
+                "hits": hits,
             }
         )
         self.last_trace = {
@@ -434,6 +455,8 @@ class QuoteDrawer:
             },
             "stats": dict(stats),
             "total_draws": sum(stats.values()),
+            "hits": dict(hits),
+            "image_hits": hits.get(target, 0),
             "final": target,
         }
         if triggered_r:
@@ -1456,6 +1479,47 @@ class QuotePlugin(Star):
         yield event.plain_result(f"⭐本群语录状态\n{body}")
         event.stop_event()
 
+    @filter.command("语录出货", alias={"出货统计", "语录统计"})
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
+    async def quote_hits(self, event: AstrMessageEvent, page: str = ""):
+        """查看每张语录被抽出的次数（按次数降序，分页）"""
+        group_id = str(event.message_obj.group_id)
+        files = self._list_quote_files(group_id)
+        if not files:
+            yield event.plain_result("⭐本群还没有语录")
+            event.stop_event()
+            return
+
+        hits = load_hits(
+            self._read_order_state(group_id), {path.name for path in files}
+        )
+        rows = sorted(
+            ((path, hits.get(path.name, 0)) for path in files),
+            key=lambda item: (-item[1], item[0].name.lower()),
+        )
+        total_hits = sum(hits.values())
+        page_size = 15
+        pages = max(1, (len(rows) + page_size - 1) // page_size)
+        try:
+            page_no = max(1, min(int(str(page).strip()), pages)) if str(page).strip() else 1
+        except ValueError:
+            page_no = 1
+
+        lines = [
+            f"⭐本群语录出货统计（共 {len(rows)} 张，累计 {total_hits} 抽）"
+        ]
+        start = (page_no - 1) * page_size
+        for index, (path, count) in enumerate(rows[start : start + page_size], start + 1):
+            rarity, display = parse_quote_rarity(path.name)
+            share = (count / total_hits * 100) if total_hits else 0.0
+            lines.append(f"{index}. {rarity}★ {display} ｜ {count} 次（{share:.1f}%）")
+        if pages > 1:
+            nxt = page_no + 1 if page_no < pages else 1
+            lines.append(f"第 {page_no}/{pages} 页，发送 /语录出货 {nxt} 翻页")
+        yield event.plain_result("\n".join(lines))
+        event.stop_event()
+
     # ------------------------------------------------------------------ #
     # 指令：设置投稿权限（仅管理员）
     # ------------------------------------------------------------------ #
@@ -2324,6 +2388,14 @@ class QuotePlugin(Star):
                 self._thumb_cache.clear()
             self._thumb_cache[cache_key] = data_url
         return data_url
+
+    def _read_order_state(self, group_id: str) -> dict:
+        """读取群目录下的 order.json（不存在或损坏时返回空字典）。"""
+        path = self._group_dir(group_id) / "order.json"
+        try:
+            return json.loads(path.read_text(encoding="utf-8")) or {}
+        except Exception:
+            return {}
 
     @staticmethod
     def _quote_sort_key(group_id: str, path: Path, sort: str, finder) -> tuple:

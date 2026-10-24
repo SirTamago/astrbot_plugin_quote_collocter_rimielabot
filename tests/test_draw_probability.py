@@ -190,7 +190,7 @@ class StateTest(unittest.TestCase):
         drawer = M.QuoteDrawer(d, window=4, weights=WEIGHTS, pity={6: 10})
         drawer.next()
         state = json.loads((d / "order.json").read_text(encoding="utf-8"))
-        self.assertEqual(set(state), {"since", "recent", "stats"})
+        self.assertEqual(set(state), {"since", "recent", "stats", "hits"})
         self.assertEqual(len(state["recent"]), 1)
         self.assertEqual(state["since"]["6"], 1)
 
@@ -354,6 +354,36 @@ class DrawStatsTest(unittest.TestCase):
         self.assertEqual(int(state["stats"]["6"]), 5)   # 每 2 抽保底一次 6★
         self.assertEqual(int(state["stats"]["3"]), 5)
         self.assertEqual(drawer.last_trace["pity"]["triggered"], 6)
+
+
+class HitsTest(unittest.TestCase):
+    """每张图片的累计被抽中次数（/语录出货 的数据源）。"""
+
+    def test_hits_accumulate_per_image(self):
+        random.seed(20261024)
+        d = make_library({3: 3})
+        drawer = M.QuoteDrawer(d, window=0, weights={3: 1.0}, pity={})
+        names = draw_many(drawer, 150)
+        hits = json.loads((d / "order.json").read_text(encoding="utf-8"))["hits"]
+        self.assertEqual(sum(hits.values()), 150)
+        self.assertEqual(set(hits), set(names))
+        self.assertEqual(len(hits), 3)
+        self.assertEqual(drawer.last_trace["image_hits"], hits[drawer.last_trace["final"]])
+
+    def test_hits_drop_deleted_files(self):
+        random.seed(20261025)
+        d = make_library({3: 2})
+        drawer = M.QuoteDrawer(d, window=0, weights={3: 1.0}, pity={})
+        for _ in range(20):
+            drawer.next()
+        state = json.loads((d / "order.json").read_text(encoding="utf-8"))
+        victim = sorted(state["hits"])[0]
+        victim_hits = state["hits"][victim]
+        (d / victim).unlink()
+        drawer.next()
+        state = json.loads((d / "order.json").read_text(encoding="utf-8"))
+        self.assertNotIn(victim, state["hits"])  # 已删除的文件不再统计
+        self.assertEqual(sum(state["hits"].values()), 21 - victim_hits)
 
 
 if __name__ == "__main__":

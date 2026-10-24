@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import unittest
 from pathlib import Path
@@ -729,6 +730,42 @@ class WeightsUpgradeTest(PluginTestBase):
         path.write_text(json.dumps(data), encoding="utf-8")
         plugin = M.QuotePlugin(self.ctx, {})
         self.assertEqual(plugin._load_rarity_weights()[1], 0)
+
+
+class HitsCommandTest(PluginTestBase):
+    """`/语录出货`：按被抽中次数降序列出每张图。"""
+
+    def setUp(self):
+        super().setUp()
+        for name in ("3.a.jpg", "3.b.jpg", "4.c.jpg"):
+            ENV.put_image(GROUP, name)
+        self.plugin._apply_group_settings(GROUP, mode=2)
+
+    def test_lists_counts_sorted(self):
+        for _ in range(30):
+            self.plugin._draw_quote(GROUP, "测试", MEMBER)
+        text = first_text(drive(self.plugin.quote_hits(event(), "")))
+        self.assertIn("本群语录出货统计", text)
+        self.assertIn("累计 30 抽", text)
+        self.assertRegex(text, r"1\. \d★ .+ ｜ \d+ 次")
+        counts = [int(x) for x in re.findall(r"｜ (\d+) 次", text)]
+        self.assertEqual(sum(counts), 30)
+        self.assertEqual(counts, sorted(counts, reverse=True))
+
+    def test_pagination(self):
+        for i in range(20):
+            ENV.put_image(GROUP, f"3.x{i:02d}.jpg")
+        text = first_text(drive(self.plugin.quote_hits(event(), "1")))
+        self.assertIn("第 1/2 页", text)
+        text2 = first_text(drive(self.plugin.quote_hits(event(), "2")))
+        self.assertIn("第 2/2 页", text2)
+
+    def test_empty_library(self):
+        for path in ENV.group_dir(GROUP).iterdir():
+            if path.is_file():
+                path.unlink()
+        text = first_text(drive(self.plugin.quote_hits(event(), "")))
+        self.assertIn("还没有语录", text)
 
 
 if __name__ == "__main__":
