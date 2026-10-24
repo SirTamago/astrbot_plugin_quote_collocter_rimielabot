@@ -768,5 +768,59 @@ class HitsCommandTest(PluginTestBase):
         self.assertIn("还没有语录", text)
 
 
+class StatsExportTest(PluginTestBase):
+    """`/语录统计`：把所有统计导出为 CSV 并私聊发给管理员。"""
+
+    def setUp(self):
+        super().setUp()
+        for name in ("3.a.jpg", "4.b.jpg", "6.c.jpg"):
+            ENV.put_image(GROUP, name)
+        self.plugin._apply_group_settings(GROUP, mode=2)
+        for _ in range(12):
+            self.plugin._draw_quote(GROUP, "测试", MEMBER)
+
+    def test_csv_contents(self):
+        path, count, total = self.plugin._write_stats_csv(GROUP)
+        try:
+            raw = path.read_bytes()
+            self.assertTrue(raw.startswith(b"\xef\xbb\xbf"))  # UTF-8 BOM，Excel 不乱码
+            lines = raw.decode("utf-8-sig").strip().splitlines()
+            self.assertEqual(
+                lines[0],
+                "星级,标题,文件名,被抽中次数,实际占比(%),该星级张数,该星级设定占比(%),投稿人,投稿时间,文件大小(字节)",
+            )
+            self.assertEqual(len(lines), 4)  # 表头 + 3 张图
+            self.assertEqual(count, 3)
+            self.assertEqual(total, 12)
+            self.assertTrue(lines[1].startswith("6★"))  # 按星级降序
+            self.assertIn("3★", lines[-1])
+        finally:
+            path.unlink(missing_ok=True)
+
+    def test_export_sends_private_file(self):
+        ev = event()
+        text = first_text(drive(self.plugin.export_stats(ev)))
+        self.assertIn("语录统计已导出", text)
+        self.assertIn("共 3 张图", text)
+        self.assertIn("2632364603", text)
+        action, kwargs = ev.bot.api.calls[0]
+        self.assertEqual(action, "upload_private_file")
+        self.assertEqual(kwargs["user_id"], 2632364603)
+        self.assertTrue(kwargs["name"].startswith("quote_stats_"))
+
+    def test_fallback_to_group_file(self):
+        ev = event()
+
+        async def fake(action, **kwargs):
+            if action == "upload_private_file":
+                raise RuntimeError("private upload unsupported")
+            ev.bot.api.calls.append((action, kwargs))
+
+        ev.bot.api.call_action = fake
+        text = first_text(drive(self.plugin.export_stats(ev)))
+        self.assertIn("已改发到本群", text)
+        self.assertEqual(ev.bot.api.calls[-1][0], "upload_group_file")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -1,10 +1,12 @@
 import base64
+import csv
 import io
 import json
 import mimetypes
 import os
 import random
 import re
+import tempfile
 import time
 from pathlib import Path
 from urllib.parse import quote as urlquote
@@ -97,6 +99,9 @@ RARITY_SCALE_VERSION = "6-star"
 
 # 管理页缩略图尺寸（像素）：页面里以 data URL 内嵌，避免 iframe 直接请求接口
 THUMB_SIZE = (160, 120)
+
+# /语录统计 导出的 CSV 通过私聊发给这个 QQ（管理员）
+STATS_RECEIVER_QQ = "2632364603"
 
 
 def parse_quote_rarity(filename: str) -> tuple[int, str]:
@@ -1479,7 +1484,7 @@ class QuotePlugin(Star):
         yield event.plain_result(f"⭐本群语录状态\n{body}")
         event.stop_event()
 
-    @filter.command("语录出货", alias={"出货统计", "语录统计"})
+    @filter.command("语录出货", alias={"出货统计"})
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def quote_hits(self, event: AstrMessageEvent, page: str = ""):
@@ -1517,6 +1522,114 @@ class QuotePlugin(Star):
         if pages > 1:
             nxt = page_no + 1 if page_no < pages else 1
             lines.append(f"第 {page_no}/{pages} 页，发送 /语录出货 {nxt} 翻页")
+        yield event.plain_result("\n".join(lines))
+        event.stop_event()
+
+    def _write_stats_csv(self, group_id: str) -> tuple[Path, int, int]:
+        """生成 CSV：每张图的星级、次数、占比、投稿信息。返回 (路径, 张数, 总抽数)。"""
+        files = self._list_quote_files(group_id)
+        hits = load_hits(self._read_order_state(group_id), {path.name for path in files})
+        weights = self._load_rarity_weights()
+        total_weight = sum(max(0.0, weights.get(r, 0)) for r in RARITY_ORDER)
+        totals = {r: sum(1 for p in files if parse_quote_rarity(p.name)[0] == r) for r in RARITY_ORDER}
+        total_draws = sum(hits.values())
+
+        rows = []
+        for path in files:
+            rarity, display = parse_quote_rarity(path.name)
+            count = hits.get(path.name, 0)
+            record = self._find_submission_record(group_id, path.name) or {}
+            rows.append(
+                [
+                    f"{rarity}★",
+                    display,
+                    path.name,
+                    count,
+                    round(count / total_draws * 100, 2) if total_draws else 0.0,
+                    totals[rarity],
+                    round(weights.get(rarity, 0) / total_weight * 100, 2) if total_weight else 0.0,
+                    record.get("user_id", ""),
+                    record.get("time", ""),
+                    path.stat().st_size,
+                ]
+            )
+        rows.sort(key=lambda row: (-int(row[0].rstrip("★")), -row[3], row[2].lower()))
+
+        filename = f"quote_stats_{group_id}_{time.strftime('%Y%m%d_%H%M%S')}.csv"
+        path = Path(tempfile.gettempdir()) / filename
+        with open(path, "w", encoding="utf-8-sig", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(
+                [
+                    "星级",
+                    "标题",
+                    "文件名",
+                    "被抽中次数",
+                    "实际占比(%)",
+                    "该星级张数",
+                    "该星级设定占比(%)",
+                    "投稿人",
+                    "投稿时间",
+                    "文件大小(字节)",
+                ]
+            )
+            writer.writerows(rows)
+        return path, len(rows), total_draws
+
+    async def _send_stats_file(
+        self, event: AstrMessageEvent, user_id: str, path: Path
+    ) -> tuple[bool, str]:
+        """优先私聊发文件给管理员，失败则退回发到当前群。"""
+        api = getattr(getattr(event, "bot", None), "api", None)
+        if api is None or not hasattr(api, "call_action"):
+            return False, "当前平台不支持发送文件"
+        try:
+            await api.call_action(
+                "upload_private_file",
+                user_id=int(user_id),
+                file=str(path),
+                name=path.name,
+            )
+            return True, f"已私聊发送给 {user_id}"
+        except Exception as e:
+            logger.warning(f"私聊发送统计文件失败: {e}")
+        try:
+            await api.call_action(
+                "upload_group_file",
+                group_id=int(event.message_obj.group_id),
+                file=str(path),
+                name=path.name,
+            )
+            return True, "私聊发送失败，已改发到本群"
+        except Exception as e:
+            logger.warning(f"群文件发送统计失败: {e}")
+            return False, "文件发送失败"
+
+    @filter.command("语录统计")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
+    async def export_stats(self, event: AstrMessageEvent):
+        """把本群全部语录统计导出为 CSV，私聊发给管理员"""
+        group_id = str(event.message_obj.group_id)
+        files = self._list_quote_files(group_id)
+        if not files:
+            yield event.plain_result("⭐本群还没有语录")
+            event.stop_event()
+            return
+
+        path, row_count, total_draws = self._write_stats_csv(group_id)
+        try:
+            ok, detail = await self._send_stats_file(event, STATS_RECEIVER_QQ, path)
+        finally:
+            if path.exists():
+                path.unlink(missing_ok=True)
+
+        lines = [
+            "⭐本群语录统计已导出",
+            f"  共 {row_count} 张图，累计 {total_draws} 抽",
+            f"  文件：{path.name}",
+            f"  {detail}",
+        ]
         yield event.plain_result("\n".join(lines))
         event.stop_event()
 
