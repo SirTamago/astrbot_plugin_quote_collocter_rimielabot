@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import re
 import shutil
@@ -807,6 +808,11 @@ class StatsExportTest(PluginTestBase):
         self.assertEqual(action, "upload_private_file")
         self.assertEqual(kwargs["user_id"], 2632364603)
         self.assertTrue(kwargs["name"].startswith("quote_stats_"))
+        # 用 base64:// 传内容，避免协议端读不到 AstrBot 的 /tmp
+        self.assertTrue(kwargs["file"].startswith("base64://"))
+        csv_text = base64.b64decode(kwargs["file"][len("base64://"):]).decode("utf-8-sig")
+        self.assertIn("被抽中次数", csv_text)
+        self.assertIn("3.a.jpg", csv_text)
 
     def test_fallback_to_group_file(self):
         ev = event()
@@ -820,6 +826,7 @@ class StatsExportTest(PluginTestBase):
         text = first_text(drive(self.plugin.export_stats(ev)))
         self.assertIn("已改发到本群", text)
         self.assertEqual(ev.bot.api.calls[-1][0], "upload_group_file")
+        self.assertTrue(ev.bot.api.calls[-1][1]["file"].startswith("base64://"))
 
 
 class HelpCommandTest(PluginTestBase):

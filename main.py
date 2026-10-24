@@ -1625,15 +1625,20 @@ class QuotePlugin(Star):
     async def _send_stats_file(
         self, event: AstrMessageEvent, user_id: str, path: Path
     ) -> tuple[bool, str]:
-        """优先私聊发文件给管理员，失败则退回发到当前群。"""
+        """优先私聊发文件给管理员，失败则退回发到当前群。
+
+        文件内容用 ``base64://`` 传递：协议端（NapCat 等）通常和 AstrBot 不在同一个
+        文件系统里，直接传 /tmp 路径会报「识别URL失败」。CSV 很小，base64 足够。
+        """
         api = getattr(getattr(event, "bot", None), "api", None)
         if api is None or not hasattr(api, "call_action"):
             return False, "当前平台不支持发送文件"
+        payload = "base64://" + base64.b64encode(path.read_bytes()).decode()
         try:
             await api.call_action(
                 "upload_private_file",
                 user_id=int(user_id),
-                file=str(path),
+                file=payload,
                 name=path.name,
             )
             return True, f"已私聊发送给 {user_id}"
@@ -1643,7 +1648,7 @@ class QuotePlugin(Star):
             await api.call_action(
                 "upload_group_file",
                 group_id=int(event.message_obj.group_id),
-                file=str(path),
+                file=payload,
                 name=path.name,
             )
             return True, "私聊发送失败，已改发到本群"
